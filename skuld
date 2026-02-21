@@ -181,6 +181,64 @@ def unit_active(unit: str) -> str:
     return status if status else "inactive"
 
 
+def read_timer_schedule(name: str) -> str:
+    timer_unit = f"{name}.timer"
+    if not unit_exists(timer_unit):
+        return ""
+    show = systemctl_show(timer_unit, ["OnCalendar"])
+    return (show.get("OnCalendar", "") or "").strip()
+
+
+def schedule_for_display(svc: ManagedService) -> str:
+    if svc.schedule:
+        return svc.schedule
+    return read_timer_schedule(svc.name)
+
+
+def sync_registry_from_systemd(name: Optional[str] = None) -> int:
+    services = load_registry()
+    changed = 0
+    target_names = {name} if name else None
+    updated: List[ManagedService] = []
+
+    for svc in services:
+        if target_names and svc.name not in target_names:
+            updated.append(svc)
+            continue
+
+        new_svc = ManagedService(**asdict(svc))
+        svc_unit = f"{svc.name}.service"
+        timer_unit = f"{svc.name}.timer"
+
+        if unit_exists(svc_unit):
+            show_svc = systemctl_show(svc_unit, ["Description", "WorkingDirectory", "User", "Restart"])
+            if not new_svc.description and show_svc.get("Description"):
+                new_svc.description = show_svc["Description"]
+            if not new_svc.working_dir and show_svc.get("WorkingDirectory"):
+                new_svc.working_dir = show_svc["WorkingDirectory"]
+            if not new_svc.user and show_svc.get("User"):
+                new_svc.user = show_svc["User"]
+            if (not new_svc.restart or new_svc.restart == "on-failure") and show_svc.get("Restart"):
+                new_svc.restart = show_svc["Restart"]
+
+        if unit_exists(timer_unit):
+            show_timer = systemctl_show(timer_unit, ["OnCalendar", "Persistent"])
+            if not new_svc.schedule and show_timer.get("OnCalendar"):
+                new_svc.schedule = show_timer["OnCalendar"]
+            if show_timer.get("Persistent"):
+                new_svc.timer_persistent = parse_bool(show_timer["Persistent"], default=new_svc.timer_persistent)
+
+        if asdict(new_svc) != asdict(svc):
+            changed += 1
+            updated.append(new_svc)
+        else:
+            updated.append(svc)
+
+    if changed:
+        save_registry(updated)
+    return changed
+
+
 def systemctl_show(unit: str, props: List[str]) -> Dict[str, str]:
     cmd = ["systemctl", "show", unit, "--no-pager"]
     for p in props:
@@ -313,6 +371,7 @@ def create(args: argparse.Namespace) -> None:
 
 def list_services(_args: argparse.Namespace) -> None:
     require_systemctl()
+    sync_registry_from_systemd()
     services = load_registry()
     if not services:
         print("No services managed by skuld.")
@@ -325,7 +384,7 @@ def list_services(_args: argparse.Namespace) -> None:
         t_unit = f"{svc.name}.timer"
         s_state = unit_active(s_unit) if unit_exists(s_unit) else "missing"
         t_state = unit_active(t_unit) if unit_exists(t_unit) else "n/a"
-        schedule = svc.schedule if svc.schedule else "-"
+        schedule = schedule_for_display(svc) or "-"
         print(f"{svc.name:24} {s_state:10} {t_state:10} {schedule:28}")
 
 
@@ -437,6 +496,7 @@ def adopt(args: argparse.Namespace) -> None:
 
 def doctor(_args: argparse.Namespace) -> None:
     require_systemctl()
+    sync_registry_from_systemd()
     services = load_registry()
     if not services:
         print("No services managed by skuld.")
@@ -456,6 +516,13 @@ def doctor(_args: argparse.Namespace) -> None:
             print(f"{line_prefix} service={st}")
 
         has_timer = bool(svc.schedule)
+        runtime_schedule = read_timer_schedule(svc.name)
+        if not has_timer and runtime_schedule:
+            print(
+                f"{line_prefix} WARN registry schedule is empty, "
+                f"but timer OnCalendar is '{runtime_schedule}'"
+            )
+            issues += 1
         if has_timer and not unit_exists(timer_unit):
             print(f"{line_prefix} ERROR expected timer is missing ({timer_unit})")
             issues += 1
@@ -543,6 +610,7 @@ def edit(args: argparse.Namespace) -> None:
 def describe(args: argparse.Namespace) -> None:
     require_systemctl()
     validate_name(args.name)
+    sync_registry_from_systemd(args.name)
     svc = require_managed(args.name)
     service_unit = f"{args.name}.service"
     timer_unit = f"{args.name}.timer"
@@ -597,7 +665,7 @@ def tui_loop(stdscr: "curses._CursesWindow") -> None:
         for i, svc in enumerate(services[: max(0, height - 6)]):
             s_state = unit_active(f"{svc.name}.service") if unit_exists(f"{svc.name}.service") else "missing"
             t_state = unit_active(f"{svc.name}.timer") if unit_exists(f"{svc.name}.timer") else "n/a"
-            sched = svc.schedule or "-"
+            sched = schedule_for_display(svc) or "-"
             line = f"{svc.name:20} {s_state:10} {t_state:10} {sched:20}"
             attr = curses.A_REVERSE if i == idx else curses.A_NORMAL
             stdscr.addstr(4 + i, 0, line[: max(0, width - 1)], attr)
@@ -638,7 +706,20 @@ def tui_loop(stdscr: "curses._CursesWindow") -> None:
 
 def tui(_args: argparse.Namespace) -> None:
     require_systemctl()
+    sync_registry_from_systemd()
     curses.wrapper(tui_loop)
+
+
+def sync(args: argparse.Namespace) -> None:
+    require_systemctl()
+    if args.name:
+        validate_name(args.name)
+        require_managed(args.name)
+    changed = sync_registry_from_systemd(args.name)
+    if changed == 0:
+        ok("Registry is already up to date.")
+    else:
+        ok(f"Registry updated for {changed} service(s).")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -722,6 +803,10 @@ def build_parser() -> argparse.ArgumentParser:
     ds = sub.add_parser("describe", help="Show details for a managed service")
     ds.add_argument("--name", required=True)
     ds.set_defaults(func=describe)
+
+    sy = sub.add_parser("sync", help="Backfill missing registry fields from systemd")
+    sy.add_argument("--name", help="Sync only one managed service")
+    sy.set_defaults(func=sync)
 
     t = sub.add_parser("tui", help="Open terminal UI")
     t.set_defaults(func=tui)
