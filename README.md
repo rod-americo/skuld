@@ -25,6 +25,8 @@ It watches only what you intentionally place in its care, then makes sure those 
 - Start, stop, restart, execute-now, inspect status, and read logs via `journalctl`.
 - Adopt existing `systemd` services into the Skuld registry.
 - Run `doctor` checks to detect registry/unit mismatches.
+- Backfill missing registry fields from systemd with `skuld sync`.
+- Show CPU and memory usage in `skuld list` and in the TUI table.
 - Lightweight terminal UI (`skuld tui`) for quick operations.
 
 ## Requirements
@@ -97,6 +99,7 @@ Only services present in this file can be operated by:
 - `remove`
 - `describe`
 - `edit`
+- `sync --name <service>`
 
 ## Usage
 
@@ -177,24 +180,31 @@ skuld stop --name my-daemon
 skuld list
 ```
 
+`skuld list` output includes: `name | service | timer | schedule | cpu | memory`.
+
 ### Execute immediately
 
 ```bash
 skuld exec --name my-job
+skuld exec my-job
 ```
 
 ### Start/Stop/Restart
 
 ```bash
 skuld start --name my-worker
+skuld start my-worker
 skuld stop --name my-worker
+skuld stop my-worker
 skuld restart --name my-worker
+skuld restart my-worker
 ```
 
 ### Logs (`journalctl`)
 
 ```bash
 skuld logs --name my-worker --lines 200
+skuld logs my-worker 200
 skuld logs --name my-worker --follow
 skuld logs --name my-job --timer --since "1 hour ago"
 ```
@@ -203,12 +213,14 @@ skuld logs --name my-job --timer --since "1 hour ago"
 
 ```bash
 skuld describe --name my-worker
+skuld describe my-worker
 ```
 
 ### Edit
 
 ```bash
 skuld edit --name my-worker --exec "python /opt/app/new_worker.py"
+skuld edit my-worker --exec "python /opt/app/new_worker.py"
 skuld edit --name my-job --schedule "*-*-* 03:00:00"
 skuld edit --name my-job --clear-schedule
 ```
@@ -217,12 +229,21 @@ skuld edit --name my-job --clear-schedule
 
 ```bash
 skuld adopt --name existing-service
+skuld adopt existing-service
 ```
 
 ### Doctor
 
 ```bash
 skuld doctor
+```
+
+### Sync registry from systemd
+
+```bash
+skuld sync
+skuld sync --name my-worker
+skuld sync my-worker
 ```
 
 ### Remove units
