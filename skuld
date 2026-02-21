@@ -764,13 +764,14 @@ def tui_loop(stdscr: "curses._CursesWindow") -> None:
 
         stdscr.addstr(0, 0, "Skuld TUI", curses.A_BOLD)
         stdscr.addstr(1, 0, message[: max(0, width - 1)])
-        stdscr.addstr(3, 0, f"{'Name':20} {'Service':10} {'Timer':10} {'Schedule':20}")
+        stdscr.addstr(3, 0, f"{'Name':18} {'Service':9} {'Timer':8} {'Schedule':20} {'CPU':8} {'Memory':8}")
 
         for i, svc in enumerate(services[: max(0, height - 6)]):
             s_state = unit_active(f"{svc.name}.service") if unit_exists(f"{svc.name}.service") else "missing"
             t_state = unit_active(f"{svc.name}.timer") if unit_exists(f"{svc.name}.timer") else "n/a"
             sched = schedule_for_display(svc) or "-"
-            line = f"{svc.name:20} {s_state:10} {t_state:10} {sched:20}"
+            usage = read_unit_usage(svc.name)
+            line = f"{svc.name:18} {s_state:9} {t_state:8} {sched:20} {usage['cpu']:8} {usage['memory']:8}"
             attr = curses.A_REVERSE if i == idx else curses.A_NORMAL
             stdscr.addstr(4 + i, 0, line[: max(0, width - 1)], attr)
 
