@@ -4,6 +4,20 @@ Skuld is a Python CLI/TUI for creating and managing `systemd` services and timer
 
 It is designed to monitor only services that were created or explicitly adopted by Skuld.
 
+## Named After
+
+**Skuld** is one of the three Norns in Norse mythology, alongside **Urdr** (the past) and **Verdandi** (the present).
+She is tied to the future: what is owed, what is bound to happen, what is next in the thread of events.
+
+That symbolism maps directly to this project.
+
+- A timer is a promise to the future.
+- A scheduled service is an obligation waiting for its time.
+- The registry is the ledger of what must still happen.
+
+Skuld does not try to manage everything in your system.
+It watches only what you intentionally place in its care, then makes sure those future actions remain visible, repeatable, and accountable.
+
 ## Features
 
 - Create `.service` units and optional `.timer` units.
