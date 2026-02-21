@@ -186,7 +186,26 @@ def read_timer_schedule(name: str) -> str:
     if not unit_exists(timer_unit):
         return ""
     show = systemctl_show(timer_unit, ["OnCalendar"])
-    return (show.get("OnCalendar", "") or "").strip()
+    schedule = (show.get("OnCalendar", "") or "").strip()
+    if schedule:
+        return schedule
+    directives = parse_unit_directives(systemctl_cat(timer_unit))
+    return (directives.get("OnCalendar", "") or "").strip()
+
+
+def read_timer_persistent(name: str, default: bool = True) -> bool:
+    timer_unit = f"{name}.timer"
+    if not unit_exists(timer_unit):
+        return default
+    show = systemctl_show(timer_unit, ["Persistent"])
+    value = (show.get("Persistent", "") or "").strip()
+    if value:
+        return parse_bool(value, default=default)
+    directives = parse_unit_directives(systemctl_cat(timer_unit))
+    raw = (directives.get("Persistent", "") or "").strip()
+    if raw:
+        return parse_bool(raw, default=default)
+    return default
 
 
 def schedule_for_display(svc: ManagedService) -> str:
@@ -222,11 +241,9 @@ def sync_registry_from_systemd(name: Optional[str] = None) -> int:
                 new_svc.restart = show_svc["Restart"]
 
         if unit_exists(timer_unit):
-            show_timer = systemctl_show(timer_unit, ["OnCalendar", "Persistent"])
-            if not new_svc.schedule and show_timer.get("OnCalendar"):
-                new_svc.schedule = show_timer["OnCalendar"]
-            if show_timer.get("Persistent"):
-                new_svc.timer_persistent = parse_bool(show_timer["Persistent"], default=new_svc.timer_persistent)
+            if not new_svc.schedule:
+                new_svc.schedule = read_timer_schedule(svc.name)
+            new_svc.timer_persistent = read_timer_persistent(svc.name, default=new_svc.timer_persistent)
 
         if asdict(new_svc) != asdict(svc):
             changed += 1
