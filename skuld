@@ -202,6 +202,62 @@ def unit_active(unit: str) -> str:
     return status if status else "inactive"
 
 
+def format_bytes(value: str) -> str:
+    raw = (value or "").strip()
+    if not raw or raw in ("[not set]", "n/a"):
+        return "-"
+    try:
+        num = int(raw)
+    except ValueError:
+        return "-"
+    if num < 0:
+        return "-"
+    units = ["B", "KB", "MB", "GB", "TB"]
+    size = float(num)
+    idx = 0
+    while size >= 1024 and idx < len(units) - 1:
+        size /= 1024.0
+        idx += 1
+    if idx == 0:
+        return f"{int(size)}{units[idx]}"
+    return f"{size:.1f}{units[idx]}"
+
+
+def format_cpu_nsec(value: str) -> str:
+    raw = (value or "").strip()
+    if not raw or raw in ("[not set]", "n/a"):
+        return "-"
+    try:
+        nsec = int(raw)
+    except ValueError:
+        return "-"
+    if nsec < 0:
+        return "-"
+    seconds = nsec / 1_000_000_000
+    if seconds < 1:
+        return f"{seconds * 1000:.0f}ms"
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    minutes = int(seconds // 60)
+    rem = seconds - (minutes * 60)
+    if minutes < 60:
+        return f"{minutes}m{rem:.0f}s"
+    hours = int(minutes // 60)
+    rem_min = minutes % 60
+    return f"{hours}h{rem_min}m"
+
+
+def read_unit_usage(name: str) -> Dict[str, str]:
+    service_unit = f"{name}.service"
+    if not unit_exists(service_unit):
+        return {"cpu": "-", "memory": "-"}
+    show = systemctl_show(service_unit, ["CPUUsageNSec", "MemoryCurrent"])
+    return {
+        "cpu": format_cpu_nsec(show.get("CPUUsageNSec", "")),
+        "memory": format_bytes(show.get("MemoryCurrent", "")),
+    }
+
+
 def read_timer_schedule(name: str) -> str:
     timer_unit = f"{name}.timer"
     if not unit_exists(timer_unit):
@@ -415,15 +471,16 @@ def list_services(_args: argparse.Namespace) -> None:
         print("No services managed by skuld.")
         return
 
-    print(f"{'name':24} {'service':10} {'timer':10} {'schedule':28}")
-    print(f"{'-' * 24} {'-' * 10} {'-' * 10} {'-' * 28}")
+    print(f"{'name':24} {'service':10} {'timer':10} {'schedule':28} {'cpu':10} {'memory':10}")
+    print(f"{'-' * 24} {'-' * 10} {'-' * 10} {'-' * 28} {'-' * 10} {'-' * 10}")
     for svc in services:
         s_unit = f"{svc.name}.service"
         t_unit = f"{svc.name}.timer"
         s_state = unit_active(s_unit) if unit_exists(s_unit) else "missing"
         t_state = unit_active(t_unit) if unit_exists(t_unit) else "n/a"
         schedule = schedule_for_display(svc) or "-"
-        print(f"{svc.name:24} {s_state:10} {t_state:10} {schedule:28}")
+        usage = read_unit_usage(svc.name)
+        print(f"{svc.name:24} {s_state:10} {t_state:10} {schedule:28} {usage['cpu']:10} {usage['memory']:10}")
 
 
 def exec_now(args: argparse.Namespace) -> None:
