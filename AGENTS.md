@@ -38,9 +38,9 @@ This file defines collaboration and coding behavior for contributors and AI agen
 ## Testing Expectations
 
 - Run syntax checks before finalizing changes:
-  - `python3 -m py_compile /Users/rodrigo/Skuld/skuld`
+  - `python3 -m py_compile ./skuld`
 - Validate CLI interface changes with:
-  - `/Users/rodrigo/Skuld/skuld --help`
+  - `./skuld --help`
   - `... <subcommand> --help` for new commands
 - If `systemd` is unavailable in the environment, state this clearly.
 
@@ -49,4 +49,3 @@ This file defines collaboration and coding behavior for contributors and AI agen
 - Update `README.md` when commands or behavior change.
 - Keep examples runnable and realistic.
 - Prefer absolute paths in this repository's documentation examples.
-
