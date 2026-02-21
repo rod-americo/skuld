@@ -120,6 +120,57 @@ skuld create \
   --timer-persistent
 ```
 
+### Timer schedules (`OnCalendar`) quick reference
+
+Skuld passes `--schedule` directly to `systemd` `OnCalendar`.
+
+Common patterns:
+
+- Every 15 minutes: `*-*-* *:00/15:00`
+- Every hour at minute 05: `*-*-* *:05:00`
+- Every day at 02:30: `*-*-* 02:30:00`
+- Every Monday at 08:00: `Mon *-*-* 08:00:00`
+- First day of each month at 00:01: `*-*-01 00:01:00`
+- Specific date/time: `2026-03-15 14:00:00`
+
+Useful checks:
+
+```bash
+systemd-analyze calendar "*-*-* *:00/15:00"
+systemctl list-timers --all
+```
+
+If you run `skuld list` and see values like `*-*-02 00:01`, that means:
+
+- any year
+- any month
+- day 2
+- at `00:01`
+
+So it runs monthly, on the 2nd day, at 00:01.
+
+### Daemon mode (long-running services)
+
+To run a service continuously, create it **without** `--schedule`.
+This creates only a `.service` unit (no `.timer`).
+
+```bash
+skuld create \
+  --name my-daemon \
+  --exec "node /opt/app/server.js" \
+  --working-dir /opt/app \
+  --restart always
+```
+
+Typical daemon lifecycle:
+
+```bash
+skuld start --name my-daemon
+skuld status --name my-daemon
+skuld logs --name my-daemon --follow
+skuld stop --name my-daemon
+```
+
 ### List managed services
 
 ```bash
