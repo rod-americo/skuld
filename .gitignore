@@ -3,3 +3,4 @@ __pycache__/
 .env
 services.json
 .local/share/skuld/services.json
+.DS_Store
