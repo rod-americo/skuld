@@ -98,7 +98,7 @@ def upsert_registry(service: ManagedService) -> None:
     services = load_registry()
     by_name = {s.name: s for s in services}
     by_name[service.name] = service
-    save_registry(sorted(by_name.values(), key=lambda s: s.name))
+    save_registry(sorted(by_name.values(), key=lambda s: s.name.lower()))
 
 
 def remove_registry(name: str) -> None:
@@ -466,11 +466,12 @@ def create(args: argparse.Namespace) -> None:
 def list_services(_args: argparse.Namespace) -> None:
     require_systemctl()
     sync_registry_from_systemd()
-    services = load_registry()
+    services = sorted(load_registry(), key=lambda s: s.name.lower())
     if not services:
         print("No services managed by skuld.")
         return
 
+    print()
     print(f"{'name':24} {'service':10} {'timer':10} {'schedule':28} {'cpu':10} {'memory':10}")
     print(f"{'-' * 24} {'-' * 10} {'-' * 10} {'-' * 28} {'-' * 10} {'-' * 10}")
     for svc in services:
@@ -481,6 +482,7 @@ def list_services(_args: argparse.Namespace) -> None:
         schedule = schedule_for_display(svc) or "-"
         usage = read_unit_usage(svc.name)
         print(f"{svc.name:24} {s_state:10} {t_state:10} {schedule:28} {usage['cpu']:10} {usage['memory']:10}")
+    print()
 
 
 def exec_now(args: argparse.Namespace) -> None:
@@ -757,8 +759,7 @@ def tui_loop(stdscr: "curses._CursesWindow") -> None:
     message = "q=quit r=refresh e=exec s=start t=stop R=restart d=describe"
 
     while True:
-        services = load_registry()
-        services.sort(key=lambda s: s.name)
+        services = sorted(load_registry(), key=lambda s: s.name.lower())
         stdscr.clear()
         height, width = stdscr.getmaxyx()
 
