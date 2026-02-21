@@ -1,0 +1,751 @@
+#!/usr/bin/env python3
+import argparse
+import curses
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+import tempfile
+from dataclasses import dataclass, asdict
+from pathlib import Path
+from typing import Dict, List, Optional
+
+VERSION = "0.3.0"
+NAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._@-]*$")
+SKULD_HOME = Path(os.environ.get("SKULD_HOME", Path.home() / ".local/share/skuld"))
+REGISTRY_FILE = SKULD_HOME / "services.json"
+DEFAULT_ENV_FILE = Path(".env")
+USE_ENV_SUDO = True
+
+
+@dataclass
+class ManagedService:
+    name: str
+    exec_cmd: str
+    description: str
+    schedule: str = ""
+    working_dir: str = ""
+    user: str = ""
+    restart: str = "on-failure"
+    timer_persistent: bool = True
+
+
+def ensure_storage() -> None:
+    SKULD_HOME.mkdir(parents=True, exist_ok=True)
+    if not REGISTRY_FILE.exists():
+        REGISTRY_FILE.write_text("[]", encoding="utf-8")
+
+
+def load_dotenv(path: Path) -> Dict[str, str]:
+    if not path.exists():
+        return {}
+    env: Dict[str, str] = {}
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        env[k.strip()] = v.strip().strip('"').strip("'")
+    return env
+
+
+def get_sudo_password() -> Optional[str]:
+    if not USE_ENV_SUDO:
+        return None
+
+    from_env = os.environ.get("SKULD_SUDO_PASSWORD")
+    if from_env:
+        return from_env
+
+    env_path_override = os.environ.get("SKULD_ENV_FILE")
+    candidate_files = []
+    if env_path_override:
+        candidate_files.append(Path(env_path_override))
+    candidate_files.extend(
+        [
+            Path.cwd() / DEFAULT_ENV_FILE,
+            Path(__file__).resolve().parent / DEFAULT_ENV_FILE,
+            SKULD_HOME / ".env",
+        ]
+    )
+
+    for env_path in candidate_files:
+        if not env_path.exists():
+            continue
+        value = load_dotenv(env_path).get("SKULD_SUDO_PASSWORD")
+        if value:
+            return value
+    return None
+
+
+def load_registry() -> List[ManagedService]:
+    ensure_storage()
+    data = json.loads(REGISTRY_FILE.read_text(encoding="utf-8"))
+    return [ManagedService(**item) for item in data]
+
+
+def save_registry(services: List[ManagedService]) -> None:
+    ensure_storage()
+    REGISTRY_FILE.write_text(
+        json.dumps([asdict(s) for s in services], indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+
+def upsert_registry(service: ManagedService) -> None:
+    services = load_registry()
+    by_name = {s.name: s for s in services}
+    by_name[service.name] = service
+    save_registry(sorted(by_name.values(), key=lambda s: s.name))
+
+
+def remove_registry(name: str) -> None:
+    services = [s for s in load_registry() if s.name != name]
+    save_registry(services)
+
+
+def get_managed(name: str) -> Optional[ManagedService]:
+    for svc in load_registry():
+        if svc.name == name:
+            return svc
+    return None
+
+
+def require_managed(name: str) -> ManagedService:
+    svc = get_managed(name)
+    if not svc:
+        raise RuntimeError(
+            f"'{name}' is not in the skuld registry. "
+            "Only services created or adopted via skuld can be monitored."
+        )
+    return svc
+
+
+def err(msg: str) -> None:
+    print(f"[error] {msg}", file=sys.stderr)
+
+
+def info(msg: str) -> None:
+    print(f"[skuld] {msg}")
+
+
+def ok(msg: str) -> None:
+    print(f"[ok] {msg}")
+
+
+def validate_name(name: str) -> None:
+    if not NAME_RE.match(name):
+        raise ValueError("Invalid name. Use [a-zA-Z0-9._@-] and start with a letter/number.")
+
+
+def run(cmd: List[str], check: bool = True, capture: bool = False, input_text: Optional[str] = None) -> subprocess.CompletedProcess:
+    kwargs = {"text": True}
+    if capture:
+        kwargs["capture_output"] = True
+    if input_text is not None:
+        kwargs["input"] = input_text
+    proc = subprocess.run(cmd, **kwargs)
+    if check and proc.returncode != 0:
+        raise RuntimeError(f"Command failed: {' '.join(shlex.quote(c) for c in cmd)}")
+    return proc
+
+
+def run_sudo(cmd: List[str], check: bool = True, capture: bool = False) -> subprocess.CompletedProcess:
+    pwd = get_sudo_password()
+    full = ["sudo"] + cmd
+    if pwd:
+        print("[warn] Using SKULD_SUDO_PASSWORD from env/.env (avoid in production).", file=sys.stderr)
+        full = ["sudo", "-S", "-k", "-p", ""] + cmd
+        return run(full, check=check, capture=capture, input_text=pwd + "\n")
+    return run(full, check=check, capture=capture)
+
+
+def require_systemctl() -> None:
+    try:
+        run(["systemctl", "--version"], check=True, capture=True)
+    except Exception as exc:
+        raise RuntimeError("systemctl not found. This tool requires Linux with systemd.") from exc
+
+
+def unit_exists(unit: str) -> bool:
+    proc = run(["systemctl", "list-unit-files", "--no-legend", unit], check=False, capture=True)
+    out = (proc.stdout or "").strip()
+    return bool(out and unit in out)
+
+
+def unit_active(unit: str) -> str:
+    proc = run(["systemctl", "is-active", unit], check=False, capture=True)
+    status = (proc.stdout or "").strip()
+    return status if status else "inactive"
+
+
+def systemctl_show(unit: str, props: List[str]) -> Dict[str, str]:
+    cmd = ["systemctl", "show", unit, "--no-pager"]
+    for p in props:
+        cmd.extend(["-p", p])
+    proc = run(cmd, check=False, capture=True)
+    result: Dict[str, str] = {}
+    for line in (proc.stdout or "").splitlines():
+        if "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        result[k] = v
+    return result
+
+
+def systemctl_cat(unit: str) -> str:
+    proc = run(["systemctl", "cat", unit, "--no-pager"], check=False, capture=True)
+    if proc.returncode != 0:
+        return ""
+    return proc.stdout or ""
+
+
+def parse_unit_directives(unit_text: str) -> Dict[str, str]:
+    directives: Dict[str, str] = {}
+    for raw in unit_text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        directives[k] = v
+    return directives
+
+
+def parse_bool(value: str, default: bool = True) -> bool:
+    if value is None:
+        return default
+    v = value.strip().lower()
+    if v in ("1", "true", "yes", "on"):
+        return True
+    if v in ("0", "false", "no", "off"):
+        return False
+    return default
+
+
+def write_systemd_file(target: str, content: str) -> None:
+    with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8") as tf:
+        tf.write(content)
+        tmp_path = tf.name
+    try:
+        run_sudo(["cp", tmp_path, target])
+    finally:
+        Path(tmp_path).unlink(missing_ok=True)
+
+
+def render_service(name: str, description: str, exec_cmd: str, working_dir: str, user: str, restart: str) -> str:
+    wd_line = f"WorkingDirectory={working_dir}\n" if working_dir else ""
+    user_line = f"User={user}\n" if user else ""
+    return (
+        "[Unit]\n"
+        f"Description={description}\n"
+        "After=network.target\n\n"
+        "[Service]\n"
+        "Type=simple\n"
+        f"ExecStart=/bin/bash -lc {shlex.quote(exec_cmd)}\n"
+        f"Restart={restart}\n"
+        f"{user_line}{wd_line}"
+        "\n"
+        "[Install]\n"
+        "WantedBy=multi-user.target\n"
+    )
+
+
+def render_timer(name: str, schedule: str, persistent: bool) -> str:
+    p = "true" if persistent else "false"
+    return (
+        "[Unit]\n"
+        f"Description=Timer for {name}.service\n\n"
+        "[Timer]\n"
+        f"OnCalendar={schedule}\n"
+        f"Persistent={p}\n"
+        f"Unit={name}.service\n\n"
+        "[Install]\n"
+        "WantedBy=timers.target\n"
+    )
+
+
+def create(args: argparse.Namespace) -> None:
+    require_systemctl()
+    validate_name(args.name)
+
+    desc = args.description or f"Skuld service: {args.name}"
+    service_content = render_service(
+        name=args.name,
+        description=desc,
+        exec_cmd=args.exec,
+        working_dir=args.working_dir or "",
+        user=args.user or "",
+        restart=args.restart,
+    )
+    service_file = f"/etc/systemd/system/{args.name}.service"
+
+    info(f"Creating {service_file}")
+    write_systemd_file(service_file, service_content)
+
+    if args.schedule:
+        timer_content = render_timer(args.name, args.schedule, args.timer_persistent)
+        timer_file = f"/etc/systemd/system/{args.name}.timer"
+        info(f"Creating {timer_file}")
+        write_systemd_file(timer_file, timer_content)
+
+    run_sudo(["systemctl", "daemon-reload"])
+    run_sudo(["systemctl", "enable", f"{args.name}.service"])
+
+    if args.schedule:
+        run_sudo(["systemctl", "enable", "--now", f"{args.name}.timer"])
+
+    upsert_registry(
+        ManagedService(
+            name=args.name,
+            exec_cmd=args.exec,
+            description=desc,
+            schedule=args.schedule or "",
+            working_dir=args.working_dir or "",
+            user=args.user or "",
+            restart=args.restart,
+            timer_persistent=args.timer_persistent,
+        )
+    )
+    ok(f"Service '{args.name}' created and registered.")
+
+
+def list_services(_args: argparse.Namespace) -> None:
+    require_systemctl()
+    services = load_registry()
+    if not services:
+        print("No services managed by skuld.")
+        return
+
+    print(f"{'name':24} {'service':10} {'timer':10} {'schedule':28}")
+    print(f"{'-' * 24} {'-' * 10} {'-' * 10} {'-' * 28}")
+    for svc in services:
+        s_unit = f"{svc.name}.service"
+        t_unit = f"{svc.name}.timer"
+        s_state = unit_active(s_unit) if unit_exists(s_unit) else "missing"
+        t_state = unit_active(t_unit) if unit_exists(t_unit) else "n/a"
+        schedule = svc.schedule if svc.schedule else "-"
+        print(f"{svc.name:24} {s_state:10} {t_state:10} {schedule:28}")
+
+
+def exec_now(args: argparse.Namespace) -> None:
+    require_systemctl()
+    validate_name(args.name)
+    require_managed(args.name)
+    run_sudo(["systemctl", "start", f"{args.name}.service"])
+    ok(f"Execution started: {args.name}.service")
+
+
+def start_stop(args: argparse.Namespace, action: str) -> None:
+    require_systemctl()
+    validate_name(args.name)
+    require_managed(args.name)
+    run_sudo(["systemctl", action, f"{args.name}.service"])
+    ok(f"{action} -> {args.name}.service")
+    if args.with_timer:
+        run_sudo(["systemctl", action, f"{args.name}.timer"], check=False)
+        ok(f"{action} -> {args.name}.timer")
+
+
+def restart(args: argparse.Namespace) -> None:
+    start_stop(args, "restart")
+
+
+def status(args: argparse.Namespace) -> None:
+    require_systemctl()
+    validate_name(args.name)
+    require_managed(args.name)
+    run(["systemctl", "status", f"{args.name}.service", "--no-pager"], check=False)
+    run(["systemctl", "status", f"{args.name}.timer", "--no-pager"], check=False)
+
+
+def logs(args: argparse.Namespace) -> None:
+    require_systemctl()
+    validate_name(args.name)
+    require_managed(args.name)
+    unit = f"{args.name}.timer" if args.timer else f"{args.name}.service"
+    cmd = ["journalctl", "-u", unit, "-n", str(args.lines)]
+    if args.since:
+        cmd.extend(["--since", args.since])
+    if args.follow:
+        cmd.append("-f")
+    else:
+        cmd.append("--no-pager")
+    run(cmd, check=False)
+
+
+def remove(args: argparse.Namespace) -> None:
+    require_systemctl()
+    validate_name(args.name)
+    require_managed(args.name)
+
+    run_sudo(["systemctl", "disable", "--now", f"{args.name}.service"], check=False)
+    run_sudo(["systemctl", "disable", "--now", f"{args.name}.timer"], check=False)
+    run_sudo(["rm", "-f", f"/etc/systemd/system/{args.name}.service"])
+    run_sudo(["rm", "-f", f"/etc/systemd/system/{args.name}.timer"])
+    run_sudo(["systemctl", "daemon-reload"])
+
+    if args.purge:
+        remove_registry(args.name)
+    ok(f"Removed: {args.name} (purge={args.purge})")
+
+
+def adopt(args: argparse.Namespace) -> None:
+    require_systemctl()
+    validate_name(args.name)
+    if get_managed(args.name):
+        raise RuntimeError(f"'{args.name}' is already registered in skuld.")
+
+    service_unit = f"{args.name}.service"
+    timer_unit = f"{args.name}.timer"
+    if not unit_exists(service_unit):
+        raise RuntimeError(f"Service '{service_unit}' does not exist in systemd.")
+
+    service_text = systemctl_cat(service_unit)
+    directives = parse_unit_directives(service_text)
+    exec_line = directives.get("ExecStart", "")
+    if exec_line.startswith("/bin/bash -lc "):
+        exec_line = exec_line[len("/bin/bash -lc "):].strip()
+        if len(exec_line) >= 2 and exec_line[0] == exec_line[-1] and exec_line[0] in ("'", '"'):
+            exec_line = exec_line[1:-1]
+    if not exec_line:
+        raise RuntimeError("Could not infer ExecStart for adopt.")
+
+    show_service = systemctl_show(service_unit, ["Description", "WorkingDirectory", "User", "Restart"])
+    schedule = ""
+    timer_persistent = True
+    if unit_exists(timer_unit):
+        show_timer = systemctl_show(timer_unit, ["OnCalendar", "Persistent"])
+        schedule = show_timer.get("OnCalendar", "") or ""
+        timer_persistent = parse_bool(show_timer.get("Persistent", "true"), default=True)
+
+    upsert_registry(
+        ManagedService(
+            name=args.name,
+            exec_cmd=exec_line,
+            description=show_service.get("Description", f"Skuld service: {args.name}"),
+            schedule=schedule,
+            working_dir=show_service.get("WorkingDirectory", "") or "",
+            user=show_service.get("User", "") or "",
+            restart=show_service.get("Restart", "on-failure") or "on-failure",
+            timer_persistent=timer_persistent,
+        )
+    )
+    ok(f"Service '{args.name}' adopted into the skuld registry.")
+
+
+def doctor(_args: argparse.Namespace) -> None:
+    require_systemctl()
+    services = load_registry()
+    if not services:
+        print("No services managed by skuld.")
+        return
+
+    issues = 0
+    for svc in services:
+        service_unit = f"{svc.name}.service"
+        timer_unit = f"{svc.name}.timer"
+        line_prefix = f"[{svc.name}]"
+
+        if not unit_exists(service_unit):
+            print(f"{line_prefix} ERROR missing service unit ({service_unit})")
+            issues += 1
+        else:
+            st = unit_active(service_unit)
+            print(f"{line_prefix} service={st}")
+
+        has_timer = bool(svc.schedule)
+        if has_timer and not unit_exists(timer_unit):
+            print(f"{line_prefix} ERROR expected timer is missing ({timer_unit})")
+            issues += 1
+        if (not has_timer) and unit_exists(timer_unit):
+            print(f"{line_prefix} WARN timer exists, but registry has no schedule")
+            issues += 1
+
+        if unit_exists(service_unit):
+            cat = parse_unit_directives(systemctl_cat(service_unit))
+            current_exec = cat.get("ExecStart", "")
+            if svc.exec_cmd and svc.exec_cmd not in current_exec:
+                print(f"{line_prefix} WARN ExecStart differs from registry")
+                issues += 1
+
+    if issues == 0:
+        ok("doctor: no issues found.")
+    else:
+        err(f"doctor: found {issues} issue(s).")
+
+
+def edit(args: argparse.Namespace) -> None:
+    require_systemctl()
+    validate_name(args.name)
+    current = require_managed(args.name)
+
+    new_exec = args.exec if args.exec is not None else current.exec_cmd
+    new_description = args.description if args.description is not None else current.description
+    new_workdir = args.working_dir if args.working_dir is not None else current.working_dir
+    new_user = args.user if args.user is not None else current.user
+    new_restart = args.restart if args.restart is not None else current.restart
+    new_schedule = args.schedule if args.schedule is not None else current.schedule
+    if args.clear_schedule:
+        new_schedule = ""
+    new_timer_persistent = current.timer_persistent if args.timer_persistent is None else args.timer_persistent
+
+    if (
+        new_exec == current.exec_cmd
+        and new_description == current.description
+        and new_workdir == current.working_dir
+        and new_user == current.user
+        and new_restart == current.restart
+        and new_schedule == current.schedule
+        and new_timer_persistent == current.timer_persistent
+    ):
+        info("No changes detected.")
+        return
+
+    service_content = render_service(
+        name=args.name,
+        description=new_description,
+        exec_cmd=new_exec,
+        working_dir=new_workdir,
+        user=new_user,
+        restart=new_restart,
+    )
+    write_systemd_file(f"/etc/systemd/system/{args.name}.service", service_content)
+
+    timer_path = f"/etc/systemd/system/{args.name}.timer"
+    if new_schedule:
+        timer_content = render_timer(args.name, new_schedule, new_timer_persistent)
+        write_systemd_file(timer_path, timer_content)
+    else:
+        run_sudo(["rm", "-f", timer_path], check=False)
+
+    run_sudo(["systemctl", "daemon-reload"])
+    run_sudo(["systemctl", "enable", f"{args.name}.service"], check=False)
+    if new_schedule:
+        run_sudo(["systemctl", "enable", f"{args.name}.timer"], check=False)
+
+    upsert_registry(
+        ManagedService(
+            name=args.name,
+            exec_cmd=new_exec,
+            description=new_description,
+            schedule=new_schedule,
+            working_dir=new_workdir,
+            user=new_user,
+            restart=new_restart,
+            timer_persistent=new_timer_persistent,
+        )
+    )
+    ok(f"Service '{args.name}' updated.")
+
+
+def describe(args: argparse.Namespace) -> None:
+    require_systemctl()
+    validate_name(args.name)
+    svc = require_managed(args.name)
+    service_unit = f"{args.name}.service"
+    timer_unit = f"{args.name}.timer"
+
+    show_service = systemctl_show(
+        service_unit,
+        ["Id", "Description", "ActiveState", "SubState", "FragmentPath", "MainPID"],
+    )
+    show_timer = systemctl_show(
+        timer_unit,
+        ["Id", "ActiveState", "SubState", "NextElapseUSecRealtime", "LastTriggerUSec"],
+    ) if unit_exists(timer_unit) else {}
+
+    print(f"name: {svc.name}")
+    print(f"description: {svc.description}")
+    print(f"exec: {svc.exec_cmd}")
+    print(f"working_dir: {svc.working_dir or '-'}")
+    print(f"user: {svc.user or '-'}")
+    print(f"restart: {svc.restart}")
+    print(f"schedule: {svc.schedule or '-'}")
+    print(f"timer_persistent: {svc.timer_persistent}")
+    print("---")
+    print(f"service_active: {show_service.get('ActiveState', 'unknown')}")
+    print(f"service_substate: {show_service.get('SubState', 'unknown')}")
+    print(f"main_pid: {show_service.get('MainPID', '-')}")
+    print(f"fragment: {show_service.get('FragmentPath', '-')}")
+    if show_timer:
+        print(f"timer_active: {show_timer.get('ActiveState', 'unknown')}")
+        print(f"timer_substate: {show_timer.get('SubState', 'unknown')}")
+        print(f"next_run: {show_timer.get('NextElapseUSecRealtime', '-')}")
+        print(f"last_trigger: {show_timer.get('LastTriggerUSec', '-')}")
+    else:
+        print("timer: n/a")
+
+
+def tui_loop(stdscr: "curses._CursesWindow") -> None:
+    curses.curs_set(0)
+    stdscr.nodelay(False)
+    idx = 0
+    message = "q=quit r=refresh e=exec s=start t=stop R=restart d=describe"
+
+    while True:
+        services = load_registry()
+        services.sort(key=lambda s: s.name)
+        stdscr.clear()
+        height, width = stdscr.getmaxyx()
+
+        stdscr.addstr(0, 0, "Skuld TUI", curses.A_BOLD)
+        stdscr.addstr(1, 0, message[: max(0, width - 1)])
+        stdscr.addstr(3, 0, f"{'Name':20} {'Service':10} {'Timer':10} {'Schedule':20}")
+
+        for i, svc in enumerate(services[: max(0, height - 6)]):
+            s_state = unit_active(f"{svc.name}.service") if unit_exists(f"{svc.name}.service") else "missing"
+            t_state = unit_active(f"{svc.name}.timer") if unit_exists(f"{svc.name}.timer") else "n/a"
+            sched = svc.schedule or "-"
+            line = f"{svc.name:20} {s_state:10} {t_state:10} {sched:20}"
+            attr = curses.A_REVERSE if i == idx else curses.A_NORMAL
+            stdscr.addstr(4 + i, 0, line[: max(0, width - 1)], attr)
+
+        if not services:
+            stdscr.addstr(5, 0, "No registered services. Use: skuld create ...")
+
+        stdscr.refresh()
+        ch = stdscr.getch()
+
+        if ch in (ord("q"), 27):
+            return
+        if ch in (curses.KEY_DOWN, ord("j")) and services:
+            idx = min(idx + 1, len(services) - 1)
+        elif ch in (curses.KEY_UP, ord("k")) and services:
+            idx = max(idx - 1, 0)
+        elif ch == ord("r"):
+            message = "Refreshed"
+        elif ch in (ord("e"), ord("s"), ord("t"), ord("R"), ord("d")) and services:
+            selected = services[idx].name
+            if ch == ord("e"):
+                run_sudo(["systemctl", "start", f"{selected}.service"], check=False)
+                message = f"exec -> {selected}.service"
+            elif ch == ord("s"):
+                run_sudo(["systemctl", "start", f"{selected}.service"], check=False)
+                message = f"start -> {selected}.service"
+            elif ch == ord("t"):
+                run_sudo(["systemctl", "stop", f"{selected}.service"], check=False)
+                message = f"stop -> {selected}.service"
+            elif ch == ord("R"):
+                run_sudo(["systemctl", "restart", f"{selected}.service"], check=False)
+                message = f"restart -> {selected}.service"
+            elif ch == ord("d"):
+                desc = get_managed(selected)
+                if desc:
+                    message = f"{selected}: {desc.description}"
+
+
+def tui(_args: argparse.Namespace) -> None:
+    require_systemctl()
+    curses.wrapper(tui_loop)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="skuld", description="CLI/TUI for managing systemd services")
+    p.add_argument(
+        "--no-env-sudo",
+        action="store_true",
+        help="Disable SKULD_SUDO_PASSWORD from env/.env and use regular sudo behavior",
+    )
+    sub = p.add_subparsers(dest="command", required=True)
+
+    c = sub.add_parser("create", help="Create and install .service and optional .timer")
+    c.add_argument("--name", required=True)
+    c.add_argument("--exec", required=True, help="ExecStart command")
+    c.add_argument("--description")
+    c.add_argument("--working-dir")
+    c.add_argument("--user")
+    c.add_argument("--restart", default="on-failure")
+    c.add_argument("--schedule", help="Timer OnCalendar expression")
+    c.add_argument("--timer-persistent", action=argparse.BooleanOptionalAction, default=True)
+    c.set_defaults(func=create)
+
+    l = sub.add_parser("list", help="List services managed by skuld")
+    l.set_defaults(func=list_services)
+
+    e = sub.add_parser("exec", help="Execute a service immediately")
+    e.add_argument("--name", required=True)
+    e.set_defaults(func=exec_now)
+
+    s = sub.add_parser("start", help="Start service")
+    s.add_argument("--name", required=True)
+    s.add_argument("--with-timer", action="store_true")
+    s.set_defaults(func=lambda a: start_stop(a, "start"))
+
+    st = sub.add_parser("stop", help="Stop service")
+    st.add_argument("--name", required=True)
+    st.add_argument("--with-timer", action="store_true")
+    st.set_defaults(func=lambda a: start_stop(a, "stop"))
+
+    rs = sub.add_parser("restart", help="Restart service")
+    rs.add_argument("--name", required=True)
+    rs.add_argument("--with-timer", action="store_true")
+    rs.set_defaults(func=restart)
+
+    ps = sub.add_parser("status", help="Service/timer status")
+    ps.add_argument("--name", required=True)
+    ps.set_defaults(func=status)
+
+    lg = sub.add_parser("logs", help="Show logs from journalctl")
+    lg.add_argument("--name", required=True)
+    lg.add_argument("--lines", type=int, default=100)
+    lg.add_argument("--follow", action="store_true", help="Follow logs in real time")
+    lg.add_argument("--since", help="journalctl time filter (example: '1 hour ago')")
+    lg.add_argument("--timer", action="store_true", help="Read .timer logs instead of .service")
+    lg.set_defaults(func=logs)
+
+    rm = sub.add_parser("remove", help="Remove units")
+    rm.add_argument("--name", required=True)
+    rm.add_argument("--purge", action="store_true")
+    rm.set_defaults(func=remove)
+
+    ad = sub.add_parser("adopt", help="Adopt an existing systemd service into skuld registry")
+    ad.add_argument("--name", required=True)
+    ad.set_defaults(func=adopt)
+
+    dr = sub.add_parser("doctor", help="Check registry/systemd inconsistencies")
+    dr.set_defaults(func=doctor)
+
+    ed = sub.add_parser("edit", help="Edit a managed service definition")
+    ed.add_argument("--name", required=True)
+    ed.add_argument("--exec")
+    ed.add_argument("--description")
+    ed.add_argument("--working-dir")
+    ed.add_argument("--user")
+    ed.add_argument("--restart")
+    ed.add_argument("--schedule")
+    ed.add_argument("--clear-schedule", action="store_true")
+    ed.add_argument("--timer-persistent", action=argparse.BooleanOptionalAction, default=None)
+    ed.set_defaults(func=edit)
+
+    ds = sub.add_parser("describe", help="Show details for a managed service")
+    ds.add_argument("--name", required=True)
+    ds.set_defaults(func=describe)
+
+    t = sub.add_parser("tui", help="Open terminal UI")
+    t.set_defaults(func=tui)
+
+    v = sub.add_parser("version", help="Show version")
+    v.set_defaults(func=lambda _a: print(VERSION))
+
+    return p
+
+
+def main() -> int:
+    global USE_ENV_SUDO
+    parser = build_parser()
+    args = parser.parse_args()
+    USE_ENV_SUDO = not args.no_env_sudo
+    try:
+        args.func(args)
+        return 0
+    except KeyboardInterrupt:
+        return 130
+    except Exception as exc:
+        err(str(exc))
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

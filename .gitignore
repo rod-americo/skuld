@@ -1,0 +1,5 @@
+__pycache__/
+*.py[cod]
+.env
+services.json
+.local/share/skuld/services.json
