@@ -38,13 +38,21 @@ No external Python packages are required.
 ## Installation
 
 ```bash
-chmod +x /Users/rodrigo/Skuld/skuld
+git clone git@github.com:rod-americo/Skuld.git
+cd Skuld
+chmod +x ./skuld
+```
+
+Run from project root:
+
+```bash
+./skuld --help
 ```
 
 Optional: place it on your `PATH`.
 
 ```bash
-sudo ln -s /Users/rodrigo/Skuld/skuld /usr/local/bin/skuld
+sudo ln -s "$(pwd)/skuld" /usr/local/bin/skuld
 ```
 
 ## Security Note
