@@ -349,6 +349,16 @@ def parse_int(value: str) -> int:
     return num if num > 0 else 0
 
 
+def format_gpu_mib(value: int) -> str:
+    if value <= 0:
+        return "0MB"
+    if value < 1024:
+        return f"{value}MB"
+    gib = value / 1024
+    text = f"{gib:.1f}".rstrip("0").rstrip(".")
+    return f"{text}GB"
+
+
 def read_gpu_memory_by_pid() -> Optional[Dict[int, int]]:
     cmd = [
         "nvidia-smi",
@@ -389,7 +399,7 @@ def read_unit_usage(name: str, gpu_memory_by_pid: Optional[Dict[int, int]] = Non
     pid = parse_int(show.get("MainPID", ""))
     gpu_usage = "-"
     if gpu_memory_by_pid is not None:
-        gpu_usage = f"{gpu_memory_by_pid.get(pid, 0)}MB" if pid > 0 else "0MB"
+        gpu_usage = format_gpu_mib(gpu_memory_by_pid.get(pid, 0) if pid > 0 else 0)
     return {
         "cpu": format_cpu_nsec(show.get("CPUUsageNSec", "")),
         "memory": format_bytes(show.get("MemoryCurrent", "")),
@@ -771,7 +781,7 @@ def list_services(_args: argparse.Namespace) -> None:
             ]
         )
     render_table(
-        ["id", "name", "kind", "service", "timer", "schedule", "cpu time", "memory", "gpu memory", "ports"],
+        ["id", "name", "kind", "service", "timer", "schedule", "cpu", "memory", "gpu", "ports"],
         rows,
     )
     print()
