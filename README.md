@@ -42,7 +42,7 @@ No external Python packages are required.
 
 ```bash
 git clone git@github.com:rod-americo/skuld.git
-cd Skuld
+cd skuld
 chmod +x ./skuld
 ```
 
