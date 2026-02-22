@@ -272,7 +272,6 @@ def run_sudo(cmd: List[str], check: bool = True, capture: bool = False) -> subpr
     pwd = get_sudo_password()
     full = ["sudo"] + cmd
     if pwd:
-        print("[warn] Using SKULD_SUDO_PASSWORD from env/.env (avoid in production).", file=sys.stderr)
         full = ["sudo", "-S", "-k", "-p", ""] + cmd
         return run(full, check=check, capture=capture, input_text=pwd + "\n")
     return run(full, check=check, capture=capture)
