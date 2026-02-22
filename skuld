@@ -353,6 +353,78 @@ def read_unit_usage(name: str) -> Dict[str, str]:
     }
 
 
+def get_main_pid(name: str) -> int:
+    unit = f"{name}.service"
+    if not unit_exists(unit):
+        return 0
+    show = systemctl_show(unit, ["MainPID"])
+    raw = (show.get("MainPID", "") or "").strip()
+    try:
+        pid = int(raw)
+    except ValueError:
+        return 0
+    return pid if pid > 0 else 0
+
+
+def parse_listen_ports_from_ss(output: str, pid: int) -> List[str]:
+    ports: List[str] = []
+    seen = set()
+    marker = f"pid={pid},"
+    for line in output.splitlines():
+        if marker not in line:
+            continue
+        parts = line.split()
+        if len(parts) < 6:
+            continue
+        local = parts[4]
+        proto = parts[0].lower()
+        if proto not in ("tcp", "tcp6", "udp", "udp6"):
+            continue
+        port = ""
+        if "[" in local and "]:" in local:
+            # [::]:8000
+            port = local.rsplit("]:", 1)[-1]
+        elif ":" in local:
+            # 0.0.0.0:8000 or *:53
+            port = local.rsplit(":", 1)[-1]
+        if not port or not port.isdigit():
+            continue
+        proto_tag = "tcp" if "tcp" in proto else "udp"
+        tag = f"{port}/{proto_tag}"
+        if tag not in seen:
+            seen.add(tag)
+            ports.append(tag)
+    return sorted(ports)
+
+
+def summarize_ports(ports: List[str], max_items: int = 2) -> str:
+    if not ports:
+        return "-"
+    if len(ports) <= max_items:
+        return ",".join(ports)
+    shown = ",".join(ports[:max_items])
+    return f"{shown}+{len(ports) - max_items}"
+
+
+def read_unit_ports(name: str) -> str:
+    pid = get_main_pid(name)
+    if pid <= 0:
+        return "-"
+
+    cmd = ["ss", "-ltnup"]
+    proc = run(cmd, check=False, capture=True)
+    output = (proc.stdout or "")
+    ports = parse_listen_ports_from_ss(output, pid)
+
+    needs_sudo = not ports and ("permission denied" in (proc.stderr or "").lower())
+    if needs_sudo:
+        proc = run_sudo(cmd, check=False, capture=True)
+        output = (proc.stdout or "")
+        ports = parse_listen_ports_from_ss(output, pid)
+
+    return summarize_ports(ports)
+
+
 def render_table(headers: List[str], rows: List[List[str]]) -> None:
     if not rows:
         return
@@ -651,10 +723,11 @@ def list_services(_args: argparse.Namespace) -> None:
                 schedule,
                 usage["cpu"],
                 usage["memory"],
+                read_unit_ports(svc.name),
             ]
         )
     render_table(
-        ["id", "name", "kind", "service", "timer", "schedule", "cpu time", "memory"],
+        ["id", "name", "kind", "service", "timer", "schedule", "cpu time", "memory", "ports"],
         rows,
     )
     print()
@@ -1039,13 +1112,14 @@ def tui_loop(stdscr: "curses._CursesWindow") -> None:
 
     columns = [
         ("ID", 4),
-        ("Name", 22),
+        ("Name", 20),
         ("Kind", 8),
         ("Service", 10),
         ("Timer", 8),
-        ("Schedule", 20),
+        ("Schedule", 18),
         ("CPU", 9),
         ("Memory", 9),
+        ("Ports", 14),
     ]
 
     def hline() -> str:
@@ -1229,6 +1303,7 @@ def tui_loop(stdscr: "curses._CursesWindow") -> None:
                     sched,
                     usage["cpu"],
                     usage["memory"],
+                    read_unit_ports(svc.name),
                 ]
             )
             row_y = start_y + 3 + i
