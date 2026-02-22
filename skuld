@@ -793,6 +793,19 @@ def logs(args: argparse.Namespace) -> None:
         cmd.extend(["--since", args.since])
     if args.follow:
         cmd.append("-f")
+        # For streaming mode, avoid capture so output is shown in real time.
+        probe_cmd = [c for c in cmd if c != "-f"] + ["-n", "1", "--no-pager"]
+        probe = run(probe_cmd, check=False, capture=True)
+        probe_err = (probe.stderr or "").lower()
+        needs_sudo = (
+            "not seeing messages from other users and the system" in probe_err
+            or "permission denied" in probe_err
+        )
+        if needs_sudo:
+            run_sudo(cmd, check=False)
+        else:
+            run(cmd, check=False)
+        return
     else:
         cmd.append("--no-pager")
     proc = run(cmd, check=False, capture=True)
@@ -1417,7 +1430,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Disable SKULD_SUDO_PASSWORD from env/.env and use regular sudo behavior",
     )
-    sub = p.add_subparsers(dest="command", required=True)
+    sub = p.add_subparsers(dest="command", required=False)
 
     c = sub.add_parser("create", help="Create and install .service and optional .timer")
     c.add_argument("--name", required=True)
@@ -1539,7 +1552,21 @@ def main() -> int:
     args = parser.parse_args()
     USE_ENV_SUDO = not args.no_env_sudo
     try:
+        if not getattr(args, "command", None):
+            list_services(argparse.Namespace())
+            print("Quick help:")
+            print("  skuld <id|name> commands: exec/start/stop/restart/status/logs/describe/edit/remove")
+            print("  examples:")
+            print("    skuld start 3")
+            print("    skuld logs 3 --follow")
+            print("    skuld recreate 3")
+            print("    skuld tui")
+            return 0
+
         args.func(args)
+        if args.command in {"create", "exec", "start", "stop", "restart", "remove", "adopt", "edit", "sync"}:
+            print()
+            list_services(argparse.Namespace())
         return 0
     except KeyboardInterrupt:
         return 130
