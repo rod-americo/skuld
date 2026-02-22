@@ -48,4 +48,5 @@ This file defines collaboration and coding behavior for contributors and AI agen
 
 - Update `README.md` when commands or behavior change.
 - Keep examples runnable and realistic.
-- Prefer absolute paths in this repository's documentation examples.
+- Prefer portable paths in documentation examples (`./skuld`, `$HOME`, `$(pwd)`).
+- Avoid machine-specific absolute paths unless explicitly required.
