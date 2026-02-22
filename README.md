@@ -41,7 +41,7 @@ No external Python packages are required.
 ## Installation
 
 ```bash
-git clone git@github.com:rod-americo/Skuld.git
+git clone git@github.com:rod-americo/skuld.git
 cd Skuld
 chmod +x ./skuld
 ```
