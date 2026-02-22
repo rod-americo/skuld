@@ -365,7 +365,10 @@ def read_gpu_memory_by_pid() -> Optional[Dict[int, int]]:
         "--query-compute-apps=pid,used_gpu_memory",
         "--format=csv,noheader,nounits",
     ]
-    proc = run(cmd, check=False, capture=True)
+    try:
+        proc = run(cmd, check=False, capture=True)
+    except FileNotFoundError:
+        return None
     if proc.returncode != 0:
         return None
 
