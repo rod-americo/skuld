@@ -673,6 +673,8 @@ def logs(args: argparse.Namespace) -> None:
     require_systemctl()
     unit = f"{name}.timer" if args.timer else f"{name}.service"
     cmd = ["journalctl", "-u", unit, "-n", str(lines)]
+    output_mode = "cat" if args.plain else args.output
+    cmd.extend(["-o", output_mode])
     if args.since:
         cmd.extend(["--since", args.since])
     if args.follow:
@@ -680,6 +682,30 @@ def logs(args: argparse.Namespace) -> None:
     else:
         cmd.append("--no-pager")
     run(cmd, check=False)
+
+
+def recreate(args: argparse.Namespace) -> None:
+    target = resolve_managed_arg(args)
+    name = target.name
+    sync_registry_from_systemd(name)
+    svc = require_managed(name)
+
+    lines = [
+        "skuld create \\",
+        f"  --name {shlex.quote(svc.name)} \\",
+        f"  --description {shlex.quote(svc.description)} \\",
+    ]
+    if svc.working_dir:
+        lines.append(f"  --working-dir {shlex.quote(svc.working_dir)} \\")
+    if svc.user:
+        lines.append(f"  --user {shlex.quote(svc.user)} \\")
+    lines.append(f"  --restart {shlex.quote(svc.restart)} \\")
+    lines.append(f"  --exec {shlex.quote(svc.exec_cmd)}")
+    if svc.schedule:
+        lines[-1] = lines[-1] + " \\"
+        lines.append(f"  --schedule {shlex.quote(svc.schedule)} \\")
+        lines.append("  --timer-persistent" if svc.timer_persistent else "  --no-timer-persistent")
+    print("\n".join(lines))
 
 
 def remove(args: argparse.Namespace) -> None:
@@ -1129,6 +1155,8 @@ def build_parser() -> argparse.ArgumentParser:
     lg.add_argument("--folow", dest="follow", action="store_true", help=argparse.SUPPRESS)
     lg.add_argument("--since", help="journalctl time filter (example: '1 hour ago')")
     lg.add_argument("--timer", action="store_true", help="Read .timer logs instead of .service")
+    lg.add_argument("--output", default="short", help="journalctl output mode (e.g. short, short-iso, cat, json)")
+    lg.add_argument("--plain", action="store_true", help="Shortcut for --output cat (message only)")
     lg.set_defaults(func=logs)
 
     rm = sub.add_parser("remove", help="Remove units")
@@ -1165,6 +1193,12 @@ def build_parser() -> argparse.ArgumentParser:
     ds.add_argument("--name", dest="name_flag")
     ds.add_argument("--id", dest="id_flag", type=int)
     ds.set_defaults(func=describe)
+
+    rc = sub.add_parser("recreate", help="Print equivalent skuld create command for a managed service")
+    rc.add_argument("name", nargs="?")
+    rc.add_argument("--name", dest="name_flag")
+    rc.add_argument("--id", dest="id_flag", type=int)
+    rc.set_defaults(func=recreate)
 
     sy = sub.add_parser("sync", help="Backfill missing registry fields from systemd")
     sy.add_argument("name", nargs="?", help="Sync only one managed service")

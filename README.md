@@ -26,6 +26,7 @@ It watches only what you intentionally place in its care, then makes sure those 
 - Adopt existing `systemd` services into the Skuld registry.
 - Run `doctor` checks to detect registry/unit mismatches.
 - Backfill missing registry fields from systemd with `skuld sync`.
+- Generate an equivalent `skuld create` command from an existing managed service with `skuld recreate`.
 - Show CPU and memory usage in `skuld list` and in the TUI table.
 - Lightweight terminal UI (`skuld tui`) for quick operations.
 
@@ -207,7 +208,11 @@ skuld logs --name my-worker --lines 200
 skuld logs my-worker 200
 skuld logs --name my-worker --follow
 skuld logs --name my-job --timer --since "1 hour ago"
+skuld logs 3 --plain
+skuld logs 3 --output short-iso
 ```
+
+`--plain` uses `journalctl -o cat` (message only, no timestamp/host/process prefix).
 
 ### Describe
 
@@ -215,6 +220,16 @@ skuld logs --name my-job --timer --since "1 hour ago"
 skuld describe --name my-worker
 skuld describe my-worker
 ```
+
+### Recreate command from a managed service
+
+```bash
+skuld recreate --name my-worker
+skuld recreate my-worker
+skuld recreate 3
+```
+
+This prints an equivalent `skuld create ...` command based on current registry/systemd data.
 
 ### Edit
 
