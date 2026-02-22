@@ -1554,13 +1554,8 @@ def main() -> int:
     try:
         if not getattr(args, "command", None):
             list_services(argparse.Namespace())
-            print("Quick help:")
-            print("  skuld <id|name> commands: exec/start/stop/restart/status/logs/describe/edit/remove")
-            print("  examples:")
-            print("    skuld start 3")
-            print("    skuld logs 3 --follow")
-            print("    skuld recreate 3")
-            print("    skuld tui")
+            print("Quick help: skuld <id|name> commands: exec/start/stop/restart/status/logs/describe/edit/remove")
+            print()
             return 0
 
         args.func(args)
