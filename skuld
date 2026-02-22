@@ -720,7 +720,23 @@ def logs(args: argparse.Namespace) -> None:
         cmd.append("-f")
     else:
         cmd.append("--no-pager")
-    run(cmd, check=False)
+    proc = run(cmd, check=False, capture=True)
+    stderr = (proc.stderr or "").strip()
+    stdout = (proc.stdout or "").strip()
+
+    permission_hint = (
+        "not seeing messages from other users and the system" in stderr.lower()
+        or "permission denied" in stderr.lower()
+    )
+    if permission_hint:
+        proc = run_sudo(cmd, check=False, capture=True)
+        stderr = (proc.stderr or "").strip()
+        stdout = (proc.stdout or "").strip()
+
+    if stdout:
+        print(stdout)
+    if stderr:
+        print(stderr, file=sys.stderr)
 
 
 def recreate(args: argparse.Namespace) -> None:
