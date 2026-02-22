@@ -30,6 +30,7 @@ class ManagedService:
     user: str = ""
     restart: str = "on-failure"
     timer_persistent: bool = True
+    id: int = 0
 
 
 def ensure_storage() -> None:
@@ -83,7 +84,20 @@ def get_sudo_password() -> Optional[str]:
 def load_registry() -> List[ManagedService]:
     ensure_storage()
     data = json.loads(REGISTRY_FILE.read_text(encoding="utf-8"))
-    return [ManagedService(**item) for item in data]
+    services = [ManagedService(**item) for item in data]
+    changed = False
+    used_ids = set()
+    next_id = 1
+    for svc in services:
+        if svc.id <= 0 or svc.id in used_ids:
+            while next_id in used_ids:
+                next_id += 1
+            svc.id = next_id
+            changed = True
+        used_ids.add(svc.id)
+    if changed:
+        save_registry(services)
+    return services
 
 
 def save_registry(services: List[ManagedService]) -> None:
@@ -97,6 +111,12 @@ def save_registry(services: List[ManagedService]) -> None:
 def upsert_registry(service: ManagedService) -> None:
     services = load_registry()
     by_name = {s.name: s for s in services}
+    existing = by_name.get(service.name)
+    if service.id <= 0 and existing:
+        service.id = existing.id
+    if service.id <= 0:
+        max_id = max((s.id for s in services), default=0)
+        service.id = max_id + 1
     by_name[service.name] = service
     save_registry(sorted(by_name.values(), key=lambda s: s.name.lower()))
 
@@ -109,6 +129,13 @@ def remove_registry(name: str) -> None:
 def get_managed(name: str) -> Optional[ManagedService]:
     for svc in load_registry():
         if svc.name == name:
+            return svc
+    return None
+
+
+def get_managed_by_id(service_id: int) -> Optional[ManagedService]:
+    for svc in load_registry():
+        if svc.id == service_id:
             return svc
     return None
 
@@ -149,6 +176,50 @@ def resolve_name_arg(args: argparse.Namespace, required: bool = True) -> Optiona
     if required and not name:
         raise RuntimeError("Service name is required. Use NAME or --name NAME.")
     return name
+
+
+def resolve_managed_from_token(token: str) -> Optional[ManagedService]:
+    svc = get_managed(token)
+    if svc:
+        return svc
+    if token.isdigit():
+        return get_managed_by_id(int(token))
+    return None
+
+
+def resolve_managed_arg(args: argparse.Namespace, required: bool = True) -> Optional[ManagedService]:
+    positional = getattr(args, "name", None)
+    name_flag = getattr(args, "name_flag", None)
+    id_flag = getattr(args, "id_flag", None)
+
+    if positional and name_flag and positional != name_flag:
+        raise RuntimeError(
+            f"Conflicting targets provided: positional='{positional}' and --name='{name_flag}'."
+        )
+
+    token = name_flag or positional
+    by_token = None
+    if token:
+        by_token = resolve_managed_from_token(token)
+        if not by_token:
+            raise RuntimeError(f"Managed service '{token}' not found (name or id).")
+
+    by_id = None
+    if id_flag is not None:
+        by_id = get_managed_by_id(id_flag)
+        if not by_id:
+            raise RuntimeError(f"Managed service id '{id_flag}' not found.")
+
+    if by_token and by_id and by_token.id != by_id.id:
+        raise RuntimeError(
+            f"Conflicting targets provided: '{token}' resolves to id={by_token.id}, "
+            f"but --id={id_flag}."
+        )
+
+    svc = by_id or by_token
+    if required and not svc:
+        raise RuntimeError("Service target is required. Use NAME/ID, --name NAME, or --id ID.")
+    return svc
 
 
 def resolve_lines_arg(args: argparse.Namespace, default: int = 100) -> int:
@@ -472,8 +543,8 @@ def list_services(_args: argparse.Namespace) -> None:
         return
 
     print()
-    print(f"{'name':24} {'service':10} {'timer':10} {'schedule':28} {'cpu':10} {'memory':10}")
-    print(f"{'-' * 24} {'-' * 10} {'-' * 10} {'-' * 28} {'-' * 10} {'-' * 10}")
+    print(f"{'id':4} {'name':24} {'service':10} {'timer':10} {'schedule':28} {'cpu':10} {'memory':10}")
+    print(f"{'-' * 4} {'-' * 24} {'-' * 10} {'-' * 10} {'-' * 28} {'-' * 10} {'-' * 10}")
     for svc in services:
         s_unit = f"{svc.name}.service"
         t_unit = f"{svc.name}.timer"
@@ -481,24 +552,22 @@ def list_services(_args: argparse.Namespace) -> None:
         t_state = unit_active(t_unit) if unit_exists(t_unit) else "n/a"
         schedule = schedule_for_display(svc) or "-"
         usage = read_unit_usage(svc.name)
-        print(f"{svc.name:24} {s_state:10} {t_state:10} {schedule:28} {usage['cpu']:10} {usage['memory']:10}")
+        print(f"{svc.id:4} {svc.name:24} {s_state:10} {t_state:10} {schedule:28} {usage['cpu']:10} {usage['memory']:10}")
     print()
 
 
 def exec_now(args: argparse.Namespace) -> None:
-    name = resolve_name_arg(args)
+    svc = resolve_managed_arg(args)
+    name = svc.name
     require_systemctl()
-    validate_name(name)
-    require_managed(name)
     run_sudo(["systemctl", "start", f"{name}.service"])
     ok(f"Execution started: {name}.service")
 
 
 def start_stop(args: argparse.Namespace, action: str) -> None:
-    name = resolve_name_arg(args)
+    svc = resolve_managed_arg(args)
+    name = svc.name
     require_systemctl()
-    validate_name(name)
-    require_managed(name)
     run_sudo(["systemctl", action, f"{name}.service"])
     ok(f"{action} -> {name}.service")
     if args.with_timer:
@@ -511,20 +580,18 @@ def restart(args: argparse.Namespace) -> None:
 
 
 def status(args: argparse.Namespace) -> None:
-    name = resolve_name_arg(args)
+    svc = resolve_managed_arg(args)
+    name = svc.name
     require_systemctl()
-    validate_name(name)
-    require_managed(name)
     run(["systemctl", "status", f"{name}.service", "--no-pager"], check=False)
     run(["systemctl", "status", f"{name}.timer", "--no-pager"], check=False)
 
 
 def logs(args: argparse.Namespace) -> None:
-    name = resolve_name_arg(args)
+    svc = resolve_managed_arg(args)
+    name = svc.name
     lines = resolve_lines_arg(args, default=100)
     require_systemctl()
-    validate_name(name)
-    require_managed(name)
     unit = f"{name}.timer" if args.timer else f"{name}.service"
     cmd = ["journalctl", "-u", unit, "-n", str(lines)]
     if args.since:
@@ -537,10 +604,9 @@ def logs(args: argparse.Namespace) -> None:
 
 
 def remove(args: argparse.Namespace) -> None:
-    name = resolve_name_arg(args)
+    svc = resolve_managed_arg(args)
+    name = svc.name
     require_systemctl()
-    validate_name(name)
-    require_managed(name)
 
     run_sudo(["systemctl", "disable", "--now", f"{name}.service"], check=False)
     run_sudo(["systemctl", "disable", "--now", f"{name}.timer"], check=False)
@@ -648,9 +714,9 @@ def doctor(_args: argparse.Namespace) -> None:
 
 
 def edit(args: argparse.Namespace) -> None:
-    name = resolve_name_arg(args)
+    svc = resolve_managed_arg(args)
+    name = svc.name
     require_systemctl()
-    validate_name(name)
     current = require_managed(name)
 
     new_exec = args.exec if args.exec is not None else current.exec_cmd
@@ -713,9 +779,9 @@ def edit(args: argparse.Namespace) -> None:
 
 
 def describe(args: argparse.Namespace) -> None:
-    name = resolve_name_arg(args)
+    target = resolve_managed_arg(args)
+    name = target.name
     require_systemctl()
-    validate_name(name)
     sync_registry_from_systemd(name)
     svc = require_managed(name)
     service_unit = f"{name}.service"
@@ -765,14 +831,14 @@ def tui_loop(stdscr: "curses._CursesWindow") -> None:
 
         stdscr.addstr(0, 0, "Skuld TUI", curses.A_BOLD)
         stdscr.addstr(1, 0, message[: max(0, width - 1)])
-        stdscr.addstr(3, 0, f"{'Name':18} {'Service':9} {'Timer':8} {'Schedule':20} {'CPU':8} {'Memory':8}")
+        stdscr.addstr(3, 0, f"{'ID':3} {'Name':16} {'Service':9} {'Timer':8} {'Schedule':20} {'CPU':8} {'Memory':8}")
 
         for i, svc in enumerate(services[: max(0, height - 6)]):
             s_state = unit_active(f"{svc.name}.service") if unit_exists(f"{svc.name}.service") else "missing"
             t_state = unit_active(f"{svc.name}.timer") if unit_exists(f"{svc.name}.timer") else "n/a"
             sched = schedule_for_display(svc) or "-"
             usage = read_unit_usage(svc.name)
-            line = f"{svc.name:18} {s_state:9} {t_state:8} {sched:20} {usage['cpu']:8} {usage['memory']:8}"
+            line = f"{svc.id:3} {svc.name:16} {s_state:9} {t_state:8} {sched:20} {usage['cpu']:8} {usage['memory']:8}"
             attr = curses.A_REVERSE if i == idx else curses.A_NORMAL
             stdscr.addstr(4 + i, 0, line[: max(0, width - 1)], attr)
 
@@ -817,11 +883,9 @@ def tui(_args: argparse.Namespace) -> None:
 
 
 def sync(args: argparse.Namespace) -> None:
-    name = resolve_name_arg(args, required=False)
+    svc = resolve_managed_arg(args, required=False)
+    name = svc.name if svc else None
     require_systemctl()
-    if name:
-        validate_name(name)
-        require_managed(name)
     changed = sync_registry_from_systemd(name)
     if changed == 0:
         ok("Registry is already up to date.")
@@ -855,35 +919,41 @@ def build_parser() -> argparse.ArgumentParser:
     e = sub.add_parser("exec", help="Execute a service immediately")
     e.add_argument("name", nargs="?")
     e.add_argument("--name", dest="name_flag")
+    e.add_argument("--id", dest="id_flag", type=int)
     e.set_defaults(func=exec_now)
 
     s = sub.add_parser("start", help="Start service")
     s.add_argument("name", nargs="?")
     s.add_argument("--name", dest="name_flag")
+    s.add_argument("--id", dest="id_flag", type=int)
     s.add_argument("--with-timer", action="store_true")
     s.set_defaults(func=lambda a: start_stop(a, "start"))
 
     st = sub.add_parser("stop", help="Stop service")
     st.add_argument("name", nargs="?")
     st.add_argument("--name", dest="name_flag")
+    st.add_argument("--id", dest="id_flag", type=int)
     st.add_argument("--with-timer", action="store_true")
     st.set_defaults(func=lambda a: start_stop(a, "stop"))
 
     rs = sub.add_parser("restart", help="Restart service")
     rs.add_argument("name", nargs="?")
     rs.add_argument("--name", dest="name_flag")
+    rs.add_argument("--id", dest="id_flag", type=int)
     rs.add_argument("--with-timer", action="store_true")
     rs.set_defaults(func=restart)
 
     ps = sub.add_parser("status", help="Service/timer status")
     ps.add_argument("name", nargs="?")
     ps.add_argument("--name", dest="name_flag")
+    ps.add_argument("--id", dest="id_flag", type=int)
     ps.set_defaults(func=status)
 
     lg = sub.add_parser("logs", help="Show logs from journalctl")
     lg.add_argument("name", nargs="?")
     lg.add_argument("lines_pos", nargs="?", type=int)
     lg.add_argument("--name", dest="name_flag")
+    lg.add_argument("--id", dest="id_flag", type=int)
     lg.add_argument("--lines", type=int, default=None)
     lg.add_argument("--follow", action="store_true", help="Follow logs in real time")
     lg.add_argument("--since", help="journalctl time filter (example: '1 hour ago')")
@@ -893,6 +963,7 @@ def build_parser() -> argparse.ArgumentParser:
     rm = sub.add_parser("remove", help="Remove units")
     rm.add_argument("name", nargs="?")
     rm.add_argument("--name", dest="name_flag")
+    rm.add_argument("--id", dest="id_flag", type=int)
     rm.add_argument("--purge", action="store_true")
     rm.set_defaults(func=remove)
 
@@ -907,6 +978,7 @@ def build_parser() -> argparse.ArgumentParser:
     ed = sub.add_parser("edit", help="Edit a managed service definition")
     ed.add_argument("name", nargs="?")
     ed.add_argument("--name", dest="name_flag")
+    ed.add_argument("--id", dest="id_flag", type=int)
     ed.add_argument("--exec")
     ed.add_argument("--description")
     ed.add_argument("--working-dir")
@@ -920,11 +992,13 @@ def build_parser() -> argparse.ArgumentParser:
     ds = sub.add_parser("describe", help="Show details for a managed service")
     ds.add_argument("name", nargs="?")
     ds.add_argument("--name", dest="name_flag")
+    ds.add_argument("--id", dest="id_flag", type=int)
     ds.set_defaults(func=describe)
 
     sy = sub.add_parser("sync", help="Backfill missing registry fields from systemd")
     sy.add_argument("name", nargs="?", help="Sync only one managed service")
     sy.add_argument("--name", dest="name_flag", help="Sync only one managed service")
+    sy.add_argument("--id", dest="id_flag", type=int, help="Sync only one managed service by id")
     sy.set_defaults(func=sync)
 
     t = sub.add_parser("tui", help="Open terminal UI")
