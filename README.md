@@ -175,6 +175,19 @@ skuld logs --name my-daemon --follow
 skuld stop --name my-daemon
 ```
 
+For services with timers, you can also control the timer together with the service:
+
+```bash
+skuld start my-job --with-timer
+skuld stop my-job --with-timer
+skuld restart my-job --with-timer
+```
+
+- Without `--with-timer`: action applies only to `.service`.
+- With `--with-timer`: action applies to both `.service` and `.timer`.
+- To pause future scheduled runs, use `stop ... --with-timer`.
+- To resume scheduled runs, use `start ... --with-timer`.
+
 ### List managed services
 
 ```bash
