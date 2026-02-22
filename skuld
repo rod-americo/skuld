@@ -416,7 +416,10 @@ def read_unit_ports(name: str) -> str:
     output = (proc.stdout or "")
     ports = parse_listen_ports_from_ss(output, pid)
 
-    needs_sudo = not ports and ("permission denied" in (proc.stderr or "").lower())
+    # Some systems omit process ownership details without sudo but do not emit
+    # an explicit permission error. If no port is detected for a live PID,
+    # retry with sudo.
+    needs_sudo = not ports
     if needs_sudo:
         proc = run_sudo(cmd, check=False, capture=True)
         output = (proc.stdout or "")
