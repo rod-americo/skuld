@@ -377,6 +377,16 @@ def render_table(headers: List[str], rows: List[List[str]]) -> None:
     print(hline("-"))
 
 
+def clip_text(text: str, width: int) -> str:
+    if width <= 0:
+        return ""
+    if len(text) <= width:
+        return text
+    if width <= 3:
+        return text[:width]
+    return text[: width - 3] + "..."
+
+
 def read_timer_schedule(name: str) -> str:
     timer_unit = f"{name}.timer"
     if not unit_exists(timer_unit):
@@ -888,31 +898,122 @@ def describe(args: argparse.Namespace) -> None:
 
 
 def tui_loop(stdscr: "curses._CursesWindow") -> None:
+    curses.use_default_colors()
     curses.curs_set(0)
     stdscr.nodelay(False)
+    stdscr.keypad(True)
     idx = 0
-    message = "q=quit r=refresh e=exec s=start t=stop R=restart d=describe"
+    message = "q quit | r refresh | e exec | s start | t stop | R restart | d describe"
+
+    c_header = 0
+    c_active = 0
+    c_inactive = 0
+    c_missing = 0
+    if curses.has_colors():
+        curses.start_color()
+        curses.init_pair(1, curses.COLOR_CYAN, -1)
+        curses.init_pair(2, curses.COLOR_GREEN, -1)
+        curses.init_pair(3, curses.COLOR_YELLOW, -1)
+        curses.init_pair(4, curses.COLOR_RED, -1)
+        c_header = curses.color_pair(1)
+        c_active = curses.color_pair(2)
+        c_inactive = curses.color_pair(3)
+        c_missing = curses.color_pair(4)
+
+    columns = [
+        ("ID", 4),
+        ("Name", 22),
+        ("Kind", 8),
+        ("Service", 10),
+        ("Timer", 8),
+        ("Schedule", 20),
+        ("CPU", 9),
+        ("Memory", 9),
+    ]
+
+    def hline() -> str:
+        return "+" + "+".join("-" * (w + 2) for _, w in columns) + "+"
+
+    def row_line(values: List[str]) -> str:
+        cells = []
+        for i, (_, width) in enumerate(columns):
+            value = values[i] if i < len(values) else ""
+            cells.append(f" {clip_text(value, width).ljust(width)} ")
+        return "|" + "|".join(cells) + "|"
 
     while True:
         services = sorted(load_registry(), key=lambda s: s.name.lower())
+        if services:
+            idx = max(0, min(idx, len(services) - 1))
+        else:
+            idx = 0
         stdscr.clear()
         height, width = stdscr.getmaxyx()
 
-        stdscr.addstr(0, 0, "Skuld TUI", curses.A_BOLD)
-        stdscr.addstr(1, 0, message[: max(0, width - 1)])
-        stdscr.addstr(3, 0, f"{'ID':3} {'Name':16} {'Service':9} {'Timer':8} {'Schedule':20} {'CPU':8} {'Memory':8}")
+        # Top bar
+        title = " Skuld TUI "
+        stdscr.addstr(0, 0, " " * max(0, width - 1), curses.A_REVERSE)
+        stdscr.addstr(0, 1, title[: max(0, width - 2)], curses.A_REVERSE | curses.A_BOLD)
+        stdscr.addstr(1, 1, clip_text(message, max(0, width - 2)))
 
-        for i, svc in enumerate(services[: max(0, height - 6)]):
-            s_state = unit_active(f"{svc.name}.service") if unit_exists(f"{svc.name}.service") else "missing"
-            t_state = unit_active(f"{svc.name}.timer") if unit_exists(f"{svc.name}.timer") else "n/a"
+        start_y = 3
+        border = hline()
+        header = row_line([name for name, _ in columns])
+        if len(border) > width - 1:
+            stdscr.addstr(start_y, 0, "Terminal too narrow for table view.")
+            stdscr.refresh()
+            ch = stdscr.getch()
+            if ch in (ord("q"), 27):
+                return
+            continue
+
+        stdscr.addstr(start_y, 0, border, c_header)
+        stdscr.addstr(start_y + 1, 0, header, curses.A_BOLD | c_header)
+        stdscr.addstr(start_y + 2, 0, border, c_header)
+
+        max_rows = max(0, height - (start_y + 5))
+        visible = services[:max_rows]
+        for i, svc in enumerate(visible):
+            service_state = unit_active(f"{svc.name}.service") if unit_exists(f"{svc.name}.service") else "missing"
+            timer_state = unit_active(f"{svc.name}.timer") if unit_exists(f"{svc.name}.timer") else "n/a"
             sched = schedule_for_display(svc) or "-"
             usage = read_unit_usage(svc.name)
-            line = f"{svc.id:3} {svc.name:16} {s_state:9} {t_state:8} {sched:20} {usage['cpu']:8} {usage['memory']:8}"
-            attr = curses.A_REVERSE if i == idx else curses.A_NORMAL
-            stdscr.addstr(4 + i, 0, line[: max(0, width - 1)], attr)
+            kind = "timer" if sched != "-" else "daemon"
 
-        if not services:
-            stdscr.addstr(5, 0, "No registered services. Use: skuld create ...")
+            line = row_line(
+                [
+                    str(svc.id),
+                    svc.name,
+                    kind,
+                    service_state,
+                    timer_state,
+                    sched,
+                    usage["cpu"],
+                    usage["memory"],
+                ]
+            )
+            row_y = start_y + 3 + i
+            row_attr = curses.A_REVERSE if i == idx else curses.A_NORMAL
+            stdscr.addstr(row_y, 0, line, row_attr)
+
+            # Colorize service status text in-place (if color support exists).
+            status_x = 0
+            for name, w in columns[:3]:
+                status_x += w + 3
+            status_x += 2
+            status_attr = c_missing
+            if service_state == "active":
+                status_attr = c_active
+            elif service_state == "inactive":
+                status_attr = c_inactive
+            stdscr.addstr(row_y, status_x, clip_text(service_state, columns[3][1]), row_attr | status_attr | curses.A_BOLD)
+
+        footer_y = start_y + 3 + len(visible)
+        if footer_y < height:
+            stdscr.addstr(footer_y, 0, border, c_header)
+
+        if not services and (footer_y + 1) < height:
+            stdscr.addstr(footer_y + 1, 1, "No registered services. Use: skuld create ...")
 
         stdscr.refresh()
         ch = stdscr.getch()
