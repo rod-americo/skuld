@@ -1126,6 +1126,7 @@ def build_parser() -> argparse.ArgumentParser:
     lg.add_argument("--id", dest="id_flag", type=int)
     lg.add_argument("--lines", type=int, default=None)
     lg.add_argument("--follow", action="store_true", help="Follow logs in real time")
+    lg.add_argument("--folow", dest="follow", action="store_true", help=argparse.SUPPRESS)
     lg.add_argument("--since", help="journalctl time filter (example: '1 hour ago')")
     lg.add_argument("--timer", action="store_true", help="Read .timer logs instead of .service")
     lg.set_defaults(func=logs)
