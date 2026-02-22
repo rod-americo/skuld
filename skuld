@@ -14,6 +14,7 @@ from typing import Dict, List, Optional
 
 VERSION = "0.3.0"
 NAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._@-]*$")
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 SKULD_HOME = Path(os.environ.get("SKULD_HOME", Path.home() / ".local/share/skuld"))
 REGISTRY_FILE = SKULD_HOME / "services.json"
 DEFAULT_ENV_FILE = Path(".env")
@@ -177,6 +178,10 @@ def colorize(text: str, color: str) -> str:
         "reset": "\033[0m",
     }
     return f"{palette.get(color, '')}{text}{palette['reset']}"
+
+
+def visible_len(text: str) -> int:
+    return len(ANSI_RE.sub("", text))
 
 
 def validate_name(name: str) -> None:
@@ -349,16 +354,19 @@ def read_unit_usage(name: str) -> Dict[str, str]:
 def render_table(headers: List[str], rows: List[List[str]]) -> None:
     if not rows:
         return
-    widths = [len(h) for h in headers]
+    widths = [visible_len(h) for h in headers]
     for row in rows:
         for i, cell in enumerate(row):
-            widths[i] = max(widths[i], len(cell))
+            widths[i] = max(widths[i], visible_len(cell))
 
     def hline(ch: str = "-") -> str:
         return "+" + "+".join(ch * (w + 2) for w in widths) + "+"
 
     def format_row(cells: List[str]) -> str:
-        padded = [f" {cells[i].ljust(widths[i])} " for i in range(len(cells))]
+        padded = []
+        for i, cell in enumerate(cells):
+            pad = widths[i] - visible_len(cell)
+            padded.append(f" {cell}{' ' * max(0, pad)} ")
         return "|" + "|".join(padded) + "|"
 
     print(hline("-"))
