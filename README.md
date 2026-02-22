@@ -309,6 +309,11 @@ Inside details panel:
 skuld --help
 ```
 
+## Project Docs
+
+- `CONTRIBUTING.md`: contribution workflow and expectations
+- `CHANGELOG.md`: notable changes
+
 ## License
 
 This project is licensed under the MIT License.
