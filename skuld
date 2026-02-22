@@ -15,6 +15,7 @@ from typing import Dict, List, Optional
 VERSION = "0.3.0"
 NAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._@-]*$")
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+SHELL_SAFE_RE = re.compile(r"^[A-Za-z0-9_@%+=:,./-]+$")
 SKULD_HOME = Path(os.environ.get("SKULD_HOME", Path.home() / ".local/share/skuld"))
 REGISTRY_FILE = SKULD_HOME / "services.json"
 DEFAULT_ENV_FILE = Path(".env")
@@ -387,6 +388,21 @@ def clip_text(text: str, width: int) -> str:
     return text[: width - 3] + "..."
 
 
+def shell_quote_pretty(value: str) -> str:
+    if value == "":
+        return '""'
+    if SHELL_SAFE_RE.match(value):
+        return value
+    escaped = (
+        value.replace("\\", "\\\\")
+        .replace('"', '\\"')
+        .replace("$", "\\$")
+        .replace("`", "\\`")
+    )
+    escaped = escaped.replace("\n", "\\n")
+    return f'"{escaped}"'
+
+
 def read_timer_schedule(name: str) -> str:
     timer_unit = f"{name}.timer"
     if not unit_exists(timer_unit):
@@ -692,18 +708,18 @@ def recreate(args: argparse.Namespace) -> None:
 
     lines = [
         "skuld create \\",
-        f"  --name {shlex.quote(svc.name)} \\",
-        f"  --description {shlex.quote(svc.description)} \\",
+        f"  --name {shell_quote_pretty(svc.name)} \\",
+        f"  --description {shell_quote_pretty(svc.description)} \\",
     ]
     if svc.working_dir:
-        lines.append(f"  --working-dir {shlex.quote(svc.working_dir)} \\")
+        lines.append(f"  --working-dir {shell_quote_pretty(svc.working_dir)} \\")
     if svc.user:
-        lines.append(f"  --user {shlex.quote(svc.user)} \\")
-    lines.append(f"  --restart {shlex.quote(svc.restart)} \\")
-    lines.append(f"  --exec {shlex.quote(svc.exec_cmd)}")
+        lines.append(f"  --user {shell_quote_pretty(svc.user)} \\")
+    lines.append(f"  --restart {shell_quote_pretty(svc.restart)} \\")
+    lines.append(f"  --exec {shell_quote_pretty(svc.exec_cmd)}")
     if svc.schedule:
         lines[-1] = lines[-1] + " \\"
-        lines.append(f"  --schedule {shlex.quote(svc.schedule)} \\")
+        lines.append(f"  --schedule {shell_quote_pretty(svc.schedule)} \\")
         lines.append("  --timer-persistent" if svc.timer_persistent else "  --no-timer-persistent")
     print("\n".join(lines))
 
