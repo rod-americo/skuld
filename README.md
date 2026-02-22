@@ -287,11 +287,21 @@ TUI keys:
 - `q`: quit
 - `r`: refresh
 - `j`/`k` or arrows: navigate
+- `Enter`: open service details panel
 - `e`: execute now
 - `s`: start
 - `t`: stop
 - `R`: restart
 - `d`: show description hint
+
+Inside details panel:
+
+- `q`: back to list
+- `e`: edit `exec` command
+- `c`: edit/clear `schedule`
+- `r`: show `recreate` command
+- `x`: execute immediately
+- `s` / `t` / `R`: start, stop, restart
 
 ## Command Help
 

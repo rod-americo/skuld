@@ -728,7 +728,10 @@ def recreate(args: argparse.Namespace) -> None:
     name = target.name
     sync_registry_from_systemd(name)
     svc = require_managed(name)
+    print(build_recreate_command(svc))
 
+
+def build_recreate_command(svc: ManagedService) -> str:
     lines = [
         "skuld create \\",
         f"  --name {shell_quote_pretty(svc.name)} \\",
@@ -744,7 +747,7 @@ def recreate(args: argparse.Namespace) -> None:
         lines[-1] = lines[-1] + " \\"
         lines.append(f"  --schedule {shell_quote_pretty(svc.schedule)} \\")
         lines.append("  --timer-persistent" if svc.timer_persistent else "  --no-timer-persistent")
-    print("\n".join(lines))
+    return "\n".join(lines)
 
 
 def remove(args: argparse.Namespace) -> None:
@@ -857,21 +860,28 @@ def doctor(_args: argparse.Namespace) -> None:
         err(f"doctor: found {issues} issue(s).")
 
 
-def edit(args: argparse.Namespace) -> None:
-    svc = resolve_managed_arg(args)
-    name = svc.name
-    require_systemctl()
-    current = require_managed(name)
-
-    new_exec = args.exec if args.exec is not None else current.exec_cmd
-    new_description = args.description if args.description is not None else current.description
-    new_workdir = args.working_dir if args.working_dir is not None else current.working_dir
-    new_user = args.user if args.user is not None else current.user
-    new_restart = args.restart if args.restart is not None else current.restart
-    new_schedule = args.schedule if args.schedule is not None else current.schedule
-    if args.clear_schedule:
+def apply_managed_update(
+    current: ManagedService,
+    *,
+    exec_cmd: Optional[str] = None,
+    description: Optional[str] = None,
+    working_dir: Optional[str] = None,
+    user: Optional[str] = None,
+    restart: Optional[str] = None,
+    schedule: Optional[str] = None,
+    timer_persistent: Optional[bool] = None,
+    clear_schedule: bool = False,
+) -> bool:
+    name = current.name
+    new_exec = exec_cmd if exec_cmd is not None else current.exec_cmd
+    new_description = description if description is not None else current.description
+    new_workdir = working_dir if working_dir is not None else current.working_dir
+    new_user = user if user is not None else current.user
+    new_restart = restart if restart is not None else current.restart
+    new_schedule = schedule if schedule is not None else current.schedule
+    if clear_schedule:
         new_schedule = ""
-    new_timer_persistent = current.timer_persistent if args.timer_persistent is None else args.timer_persistent
+    new_timer_persistent = current.timer_persistent if timer_persistent is None else timer_persistent
 
     if (
         new_exec == current.exec_cmd
@@ -882,8 +892,7 @@ def edit(args: argparse.Namespace) -> None:
         and new_schedule == current.schedule
         and new_timer_persistent == current.timer_persistent
     ):
-        info("No changes detected.")
-        return
+        return False
 
     service_content = render_service(
         name=name,
@@ -917,8 +926,32 @@ def edit(args: argparse.Namespace) -> None:
             user=new_user,
             restart=new_restart,
             timer_persistent=new_timer_persistent,
+            id=current.id,
         )
     )
+    return True
+
+
+def edit(args: argparse.Namespace) -> None:
+    svc = resolve_managed_arg(args)
+    name = svc.name
+    require_systemctl()
+    current = require_managed(name)
+
+    changed = apply_managed_update(
+        current,
+        exec_cmd=args.exec,
+        description=args.description,
+        working_dir=args.working_dir,
+        user=args.user,
+        restart=args.restart,
+        schedule=args.schedule,
+        timer_persistent=args.timer_persistent,
+        clear_schedule=args.clear_schedule,
+    )
+    if not changed:
+        info("No changes detected.")
+        return
     ok(f"Service '{name}' updated.")
 
 
@@ -968,7 +1001,7 @@ def tui_loop(stdscr: "curses._CursesWindow") -> None:
     stdscr.nodelay(False)
     stdscr.keypad(True)
     idx = 0
-    message = "q quit | r refresh | e exec | s start | t stop | R restart | d describe"
+    message = "q quit | Enter details | e exec | s start | t stop | R restart | d describe"
 
     c_header = 0
     c_active = 0
@@ -1008,6 +1041,128 @@ def tui_loop(stdscr: "curses._CursesWindow") -> None:
             value = values[i] if i < len(values) else ""
             cells.append(f" {clip_text(value, width).ljust(width)} ")
         return "|" + "|".join(cells) + "|"
+
+    def prompt_input(prompt: str) -> Optional[str]:
+        h, w = stdscr.getmaxyx()
+        y = max(0, h - 2)
+        stdscr.move(y, 0)
+        stdscr.clrtoeol()
+        label = f"{prompt} "
+        stdscr.addstr(y, 0, clip_text(label, max(0, w - 1)))
+        x = min(len(label), max(0, w - 2))
+        stdscr.move(y, x)
+        curses.echo()
+        curses.curs_set(1)
+        try:
+            raw = stdscr.getstr(y, x, max(1, w - x - 1))
+        finally:
+            curses.noecho()
+            curses.curs_set(0)
+        try:
+            return raw.decode("utf-8")
+        except Exception:
+            return None
+
+    def show_text_panel(title_text: str, content: str) -> None:
+        lines = content.splitlines() or [""]
+        h, w = stdscr.getmaxyx()
+        top = 2
+        left = 2
+        panel_w = max(20, min(w - 4, max((len(l) for l in lines), default=0) + 4))
+        panel_h = max(6, min(h - 4, len(lines) + 4))
+        stdscr.clear()
+        stdscr.addstr(top, left, "+" + "-" * (panel_w - 2) + "+", c_header)
+        stdscr.addstr(top + 1, left, "|" + " " * (panel_w - 2) + "|", c_header)
+        stdscr.addstr(top + 1, left + 2, clip_text(title_text, panel_w - 4), curses.A_BOLD)
+        for i in range(panel_h - 4):
+            stdscr.addstr(top + 2 + i, left, "|" + " " * (panel_w - 2) + "|", c_header)
+            if i < len(lines):
+                stdscr.addstr(top + 2 + i, left + 2, clip_text(lines[i], panel_w - 4))
+        stdscr.addstr(top + panel_h - 2, left, "|" + " " * (panel_w - 2) + "|", c_header)
+        hint = "Press any key to return"
+        stdscr.addstr(top + panel_h - 2, left + 2, clip_text(hint, panel_w - 4), c_inactive)
+        stdscr.addstr(top + panel_h - 1, left, "+" + "-" * (panel_w - 2) + "+", c_header)
+        stdscr.refresh()
+        stdscr.getch()
+
+    def detail_view(selected_name: str) -> str:
+        local_msg = "q back | e edit exec | c edit schedule | r recreate | x exec | s/t/R actions"
+        while True:
+            current = get_managed(selected_name)
+            if not current:
+                return "Service removed from registry."
+            h, w = stdscr.getmaxyx()
+            s_state = unit_active(f"{selected_name}.service") if unit_exists(f"{selected_name}.service") else "missing"
+            t_state = unit_active(f"{selected_name}.timer") if unit_exists(f"{selected_name}.timer") else "n/a"
+            usage = read_unit_usage(selected_name)
+            schedule = schedule_for_display(current) or "-"
+
+            stdscr.clear()
+            stdscr.addstr(0, 0, " " * max(0, w - 1), curses.A_REVERSE)
+            title_line = f" Service #{current.id}: {current.name} "
+            stdscr.addstr(0, 1, clip_text(title_line, max(0, w - 2)), curses.A_REVERSE | curses.A_BOLD)
+            stdscr.addstr(1, 1, clip_text(local_msg, max(0, w - 2)))
+
+            y = 3
+            rows = [
+                ("status", s_state),
+                ("timer", t_state),
+                ("schedule", schedule),
+                ("cpu", usage["cpu"]),
+                ("memory", usage["memory"]),
+                ("restart", current.restart),
+                ("working_dir", current.working_dir or "-"),
+                ("user", current.user or "-"),
+                ("description", current.description),
+                ("exec", current.exec_cmd),
+            ]
+            for label, value in rows:
+                if y >= h - 2:
+                    break
+                stdscr.addstr(y, 2, f"{label:12}", c_header | curses.A_BOLD)
+                stdscr.addstr(y, 16, clip_text(value, max(0, w - 18)))
+                y += 1
+
+            stdscr.refresh()
+            ch = stdscr.getch()
+            if ch in (ord("q"), 27):
+                return "Back to list."
+            if ch == ord("r"):
+                show_text_panel("recreate", build_recreate_command(current))
+            elif ch == ord("x"):
+                run_sudo(["systemctl", "start", f"{selected_name}.service"], check=False)
+                local_msg = f"exec -> {selected_name}.service"
+            elif ch == ord("s"):
+                apply_action_for_managed(current, "start")
+                target = "timer" if managed_uses_timer(current) else "service"
+                local_msg = f"start -> {selected_name}.{target}"
+            elif ch == ord("t"):
+                apply_action_for_managed(current, "stop")
+                target = "timer" if managed_uses_timer(current) else "service"
+                local_msg = f"stop -> {selected_name}.{target}"
+            elif ch == ord("R"):
+                apply_action_for_managed(current, "restart")
+                target = "timer" if managed_uses_timer(current) else "service"
+                local_msg = f"restart -> {selected_name}.{target}"
+            elif ch == ord("e"):
+                value = prompt_input("New exec (blank keeps current):")
+                if value is not None and value.strip():
+                    if apply_managed_update(current, exec_cmd=value.strip()):
+                        sync_registry_from_systemd(selected_name)
+                        local_msg = "Exec updated."
+                    else:
+                        local_msg = "No changes applied."
+            elif ch == ord("c"):
+                value = prompt_input("New schedule (blank clears timer):")
+                if value is not None:
+                    v = value.strip()
+                    changed = apply_managed_update(
+                        current,
+                        schedule=v if v else "",
+                        clear_schedule=(v == ""),
+                    )
+                    sync_registry_from_systemd(selected_name)
+                    local_msg = "Schedule updated." if changed else "No changes applied."
 
     while True:
         services = sorted(load_registry(), key=lambda s: s.name.lower())
@@ -1105,6 +1260,9 @@ def tui_loop(stdscr: "curses._CursesWindow") -> None:
             idx = max(idx - 1, 0)
         elif ch == ord("r"):
             message = "Refreshed"
+        elif ch in (ord("\n"), 10, 13) and services:
+            selected = services[idx]
+            message = detail_view(selected.name)
         elif ch in (ord("e"), ord("s"), ord("t"), ord("R"), ord("d")) and services:
             selected = services[idx]
             if ch == ord("e"):
