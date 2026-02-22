@@ -175,18 +175,13 @@ skuld logs --name my-daemon --follow
 skuld stop --name my-daemon
 ```
 
-For services with timers, you can also control the timer together with the service:
+For timer jobs and daemons, action routing is automatic:
 
-```bash
-skuld start my-job --with-timer
-skuld stop my-job --with-timer
-skuld restart my-job --with-timer
-```
-
-- Without `--with-timer`: action applies only to `.service`.
-- With `--with-timer`: action applies to both `.service` and `.timer`.
-- To pause future scheduled runs, use `stop ... --with-timer`.
-- To resume scheduled runs, use `start ... --with-timer`.
+- Timer job (`.timer` exists): `start/stop/restart` act on `.timer`.
+- Daemon (no timer): `start/stop/restart` act on `.service`.
+- To run a timer job immediately, use `exec <timer-job>` (starts `.service` once).
+- To pause future scheduled runs, use `stop <timer-job>`.
+- To resume scheduled runs, use `start <timer-job>`.
 
 ### List managed services
 
