@@ -162,6 +162,23 @@ def ok(msg: str) -> None:
     print(f"[ok] {msg}")
 
 
+def is_tty() -> bool:
+    return sys.stdout.isatty()
+
+
+def colorize(text: str, color: str) -> str:
+    if not is_tty():
+        return text
+    palette = {
+        "green": "\033[32m",
+        "red": "\033[31m",
+        "yellow": "\033[33m",
+        "cyan": "\033[36m",
+        "reset": "\033[0m",
+    }
+    return f"{palette.get(color, '')}{text}{palette['reset']}"
+
+
 def validate_name(name: str) -> None:
     if not NAME_RE.match(name):
         raise ValueError("Invalid name. Use [a-zA-Z0-9._@-] and start with a letter/number.")
@@ -327,6 +344,29 @@ def read_unit_usage(name: str) -> Dict[str, str]:
         "cpu": format_cpu_nsec(show.get("CPUUsageNSec", "")),
         "memory": format_bytes(show.get("MemoryCurrent", "")),
     }
+
+
+def render_table(headers: List[str], rows: List[List[str]]) -> None:
+    if not rows:
+        return
+    widths = [len(h) for h in headers]
+    for row in rows:
+        for i, cell in enumerate(row):
+            widths[i] = max(widths[i], len(cell))
+
+    def hline(ch: str = "-") -> str:
+        return "+" + "+".join(ch * (w + 2) for w in widths) + "+"
+
+    def format_row(cells: List[str]) -> str:
+        padded = [f" {cells[i].ljust(widths[i])} " for i in range(len(cells))]
+        return "|" + "|".join(padded) + "|"
+
+    print(hline("-"))
+    print(format_row(headers))
+    print(hline("="))
+    for row in rows:
+        print(format_row(row))
+    print(hline("-"))
 
 
 def read_timer_schedule(name: str) -> str:
@@ -542,17 +582,38 @@ def list_services(_args: argparse.Namespace) -> None:
         print("No services managed by skuld.")
         return
 
+    rows: List[List[str]] = []
     print()
-    print(f"{'id':4} {'name':24} {'service':10} {'timer':10} {'schedule':28} {'cpu':10} {'memory':10}")
-    print(f"{'-' * 4} {'-' * 24} {'-' * 10} {'-' * 10} {'-' * 28} {'-' * 10} {'-' * 10}")
     for svc in services:
         s_unit = f"{svc.name}.service"
         t_unit = f"{svc.name}.timer"
-        s_state = unit_active(s_unit) if unit_exists(s_unit) else "missing"
+        s_state_raw = unit_active(s_unit) if unit_exists(s_unit) else "missing"
         t_state = unit_active(t_unit) if unit_exists(t_unit) else "n/a"
         schedule = schedule_for_display(svc) or "-"
         usage = read_unit_usage(svc.name)
-        print(f"{svc.id:4} {svc.name:24} {s_state:10} {t_state:10} {schedule:28} {usage['cpu']:10} {usage['memory']:10}")
+        kind = "timer" if schedule != "-" else "daemon"
+        if s_state_raw == "active":
+            s_state = colorize("active", "green")
+        elif s_state_raw == "inactive":
+            s_state = colorize("inactive", "yellow")
+        else:
+            s_state = colorize(s_state_raw, "red")
+        rows.append(
+            [
+                str(svc.id),
+                svc.name,
+                kind,
+                s_state,
+                t_state,
+                schedule,
+                usage["cpu"],
+                usage["memory"],
+            ]
+        )
+    render_table(
+        ["id", "name", "kind", "service", "timer", "schedule", "cpu time", "memory"],
+        rows,
+    )
     print()
 
 
