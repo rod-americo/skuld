@@ -846,11 +846,25 @@ def remove(args: argparse.Namespace) -> None:
     name = svc.name
     require_systemctl()
 
-    run_sudo(["systemctl", "disable", "--now", f"{name}.service"], check=False)
-    run_sudo(["systemctl", "disable", "--now", f"{name}.timer"], check=False)
+    service_unit = f"{name}.service"
+    timer_unit = f"{name}.timer"
+
+    # Stop first to avoid lingering runtime when removing daemon units.
+    run_sudo(["systemctl", "stop", timer_unit], check=False)
+    run_sudo(["systemctl", "stop", service_unit], check=False)
+
+    # If still active for any reason (restart policies/races), force kill.
+    if unit_active(service_unit) == "active":
+        run_sudo(["systemctl", "kill", service_unit], check=False)
+        run_sudo(["systemctl", "stop", service_unit], check=False)
+
+    run_sudo(["systemctl", "disable", timer_unit], check=False)
+    run_sudo(["systemctl", "disable", service_unit], check=False)
     run_sudo(["rm", "-f", f"/etc/systemd/system/{name}.service"])
     run_sudo(["rm", "-f", f"/etc/systemd/system/{name}.timer"])
     run_sudo(["systemctl", "daemon-reload"])
+    run_sudo(["systemctl", "reset-failed", service_unit], check=False)
+    run_sudo(["systemctl", "reset-failed", timer_unit], check=False)
 
     if args.purge:
         remove_registry(name)
