@@ -341,14 +341,59 @@ def format_cpu_nsec(value: str) -> str:
     return f"{hours}h{rem_min}m"
 
 
-def read_unit_usage(name: str) -> Dict[str, str]:
+def parse_int(value: str) -> int:
+    try:
+        num = int((value or "").strip())
+    except ValueError:
+        return 0
+    return num if num > 0 else 0
+
+
+def read_gpu_memory_by_pid() -> Optional[Dict[int, int]]:
+    cmd = [
+        "nvidia-smi",
+        "--query-compute-apps=pid,used_gpu_memory",
+        "--format=csv,noheader,nounits",
+    ]
+    proc = run(cmd, check=False, capture=True)
+    if proc.returncode != 0:
+        return None
+
+    by_pid: Dict[int, int] = {}
+    output = (proc.stdout or "").strip()
+    if not output:
+        return by_pid
+
+    for line in output.splitlines():
+        parts = [p.strip() for p in line.split(",", 1)]
+        if len(parts) != 2:
+            continue
+        pid = parse_int(parts[0])
+        if pid <= 0:
+            continue
+        try:
+            used_mib = int(parts[1])
+        except ValueError:
+            continue
+        if used_mib < 0:
+            continue
+        by_pid[pid] = by_pid.get(pid, 0) + used_mib
+    return by_pid
+
+
+def read_unit_usage(name: str, gpu_memory_by_pid: Optional[Dict[int, int]] = None) -> Dict[str, str]:
     service_unit = f"{name}.service"
     if not unit_exists(service_unit):
-        return {"cpu": "-", "memory": "-"}
-    show = systemctl_show(service_unit, ["CPUUsageNSec", "MemoryCurrent"])
+        return {"cpu": "-", "memory": "-", "gpu": "-"}
+    show = systemctl_show(service_unit, ["CPUUsageNSec", "MemoryCurrent", "MainPID"])
+    pid = parse_int(show.get("MainPID", ""))
+    gpu_usage = "-"
+    if gpu_memory_by_pid is not None:
+        gpu_usage = f"{gpu_memory_by_pid.get(pid, 0)}MB" if pid > 0 else "0MB"
     return {
         "cpu": format_cpu_nsec(show.get("CPUUsageNSec", "")),
         "memory": format_bytes(show.get("MemoryCurrent", "")),
+        "gpu": gpu_usage,
     }
 
 
@@ -357,12 +402,7 @@ def get_main_pid(name: str) -> int:
     if not unit_exists(unit):
         return 0
     show = systemctl_show(unit, ["MainPID"])
-    raw = (show.get("MainPID", "") or "").strip()
-    try:
-        pid = int(raw)
-    except ValueError:
-        return 0
-    return pid if pid > 0 else 0
+    return parse_int(show.get("MainPID", ""))
 
 
 def parse_listen_ports_from_ss(output: str, pid: int) -> List[str]:
@@ -692,6 +732,7 @@ def list_services(_args: argparse.Namespace) -> None:
         return
 
     rows: List[List[str]] = []
+    gpu_memory_by_pid = read_gpu_memory_by_pid()
     print()
     for svc in services:
         s_unit = f"{svc.name}.service"
@@ -699,7 +740,7 @@ def list_services(_args: argparse.Namespace) -> None:
         s_state_raw = unit_active(s_unit) if unit_exists(s_unit) else "missing"
         t_state_raw = unit_active(t_unit) if unit_exists(t_unit) else "n/a"
         schedule = schedule_for_display(svc) or "-"
-        usage = read_unit_usage(svc.name)
+        usage = read_unit_usage(svc.name, gpu_memory_by_pid)
         kind = "timer" if schedule != "-" else "daemon"
         if s_state_raw == "active":
             s_state = colorize("active", "green")
@@ -725,11 +766,12 @@ def list_services(_args: argparse.Namespace) -> None:
                 schedule,
                 usage["cpu"],
                 usage["memory"],
+                usage["gpu"],
                 read_unit_ports(svc.name),
             ]
         )
     render_table(
-        ["id", "name", "kind", "service", "timer", "schedule", "cpu time", "memory", "ports"],
+        ["id", "name", "kind", "service", "timer", "schedule", "cpu time", "memory", "gpu memory", "ports"],
         rows,
     )
     print()
@@ -1148,6 +1190,7 @@ def tui_loop(stdscr: "curses._CursesWindow") -> None:
         ("Schedule", 18),
         ("CPU", 9),
         ("Memory", 9),
+        ("GPU", 8),
         ("Ports", 14),
     ]
 
@@ -1213,7 +1256,8 @@ def tui_loop(stdscr: "curses._CursesWindow") -> None:
             h, w = stdscr.getmaxyx()
             s_state = unit_active(f"{selected_name}.service") if unit_exists(f"{selected_name}.service") else "missing"
             t_state = unit_active(f"{selected_name}.timer") if unit_exists(f"{selected_name}.timer") else "n/a"
-            usage = read_unit_usage(selected_name)
+            gpu_memory_by_pid = read_gpu_memory_by_pid()
+            usage = read_unit_usage(selected_name, gpu_memory_by_pid)
             schedule = schedule_for_display(current) or "-"
 
             stdscr.clear()
@@ -1229,6 +1273,7 @@ def tui_loop(stdscr: "curses._CursesWindow") -> None:
                 ("schedule", schedule),
                 ("cpu", usage["cpu"]),
                 ("memory", usage["memory"]),
+                ("gpu memory", usage["gpu"]),
                 ("restart", current.restart),
                 ("working_dir", current.working_dir or "-"),
                 ("user", current.user or "-"),
@@ -1315,11 +1360,12 @@ def tui_loop(stdscr: "curses._CursesWindow") -> None:
 
         max_rows = max(0, height - (start_y + 5))
         visible = services[:max_rows]
+        gpu_memory_by_pid = read_gpu_memory_by_pid()
         for i, svc in enumerate(visible):
             service_state = unit_active(f"{svc.name}.service") if unit_exists(f"{svc.name}.service") else "missing"
             timer_state = unit_active(f"{svc.name}.timer") if unit_exists(f"{svc.name}.timer") else "n/a"
             sched = schedule_for_display(svc) or "-"
-            usage = read_unit_usage(svc.name)
+            usage = read_unit_usage(svc.name, gpu_memory_by_pid)
             kind = "timer" if sched != "-" else "daemon"
 
             line = row_line(
@@ -1332,6 +1378,7 @@ def tui_loop(stdscr: "curses._CursesWindow") -> None:
                     sched,
                     usage["cpu"],
                     usage["memory"],
+                    usage["gpu"],
                     read_unit_ports(svc.name),
                 ]
             )

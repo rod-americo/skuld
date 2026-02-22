@@ -27,7 +27,7 @@ It watches only what you intentionally place in its care, then makes sure those 
 - Run `doctor` checks to detect registry/unit mismatches.
 - Backfill missing registry fields from systemd with `skuld sync`.
 - Generate an equivalent `skuld create` command from an existing managed service with `skuld recreate`.
-- Show CPU, memory, and listening ports in `skuld list` and in the TUI table.
+- Show CPU, memory, GPU memory, and listening ports in `skuld list` and in the TUI table.
 - Lightweight terminal UI (`skuld tui`) for quick operations.
 
 ## Requirements
@@ -189,7 +189,7 @@ For timer jobs and daemons, action routing is automatic:
 skuld list
 ```
 
-`skuld list` output includes: `id | name | kind | service | timer | schedule | cpu time | memory | ports`.
+`skuld list` output includes: `id | name | kind | service | timer | schedule | cpu time | memory | gpu memory | ports`.
 
 ### Execute immediately
 
