@@ -203,10 +203,13 @@ skuld exec my-job
 ```bash
 skuld start --name my-worker
 skuld start my-worker
+skuld start 2 4 5
 skuld stop --name my-worker
 skuld stop my-worker
+skuld stop 2 4 5
 skuld restart --name my-worker
 skuld restart my-worker
+skuld restart api-worker 7
 ```
 
 ### Logs (`journalctl`)

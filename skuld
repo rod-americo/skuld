@@ -246,6 +246,33 @@ def resolve_managed_arg(args: argparse.Namespace, required: bool = True) -> Opti
     return svc
 
 
+def resolve_managed_many_arg(args: argparse.Namespace) -> List[ManagedService]:
+    positional_tokens = getattr(args, "targets", None) or []
+    name_flag = getattr(args, "name_flag", None)
+    id_flag = getattr(args, "id_flag", None)
+
+    tokens: List[str] = list(positional_tokens)
+    if name_flag:
+        tokens.append(name_flag)
+    if id_flag is not None:
+        tokens.append(str(id_flag))
+
+    if not tokens:
+        raise RuntimeError("At least one service target is required. Use NAME/ID, --name NAME, or --id ID.")
+
+    resolved: List[ManagedService] = []
+    seen_ids = set()
+    for token in tokens:
+        svc = resolve_managed_from_token(token)
+        if not svc:
+            raise RuntimeError(f"Managed service '{token}' not found (name or id).")
+        if svc.id in seen_ids:
+            continue
+        seen_ids.add(svc.id)
+        resolved.append(svc)
+    return resolved
+
+
 def resolve_lines_arg(args: argparse.Namespace, default: int = 100) -> int:
     lines_flag = getattr(args, "lines", None)
     lines_pos = getattr(args, "lines_pos", None)
@@ -818,9 +845,10 @@ def apply_action_for_managed(svc: ManagedService, action: str) -> None:
 
 
 def start_stop(args: argparse.Namespace, action: str) -> None:
-    svc = resolve_managed_arg(args)
+    services = resolve_managed_many_arg(args)
     require_systemctl()
-    apply_action_for_managed(svc, action)
+    for svc in services:
+        apply_action_for_managed(svc, action)
 
 
 def restart(args: argparse.Namespace) -> None:
@@ -1512,20 +1540,20 @@ def build_parser() -> argparse.ArgumentParser:
     e.add_argument("--id", dest="id_flag", type=int)
     e.set_defaults(func=exec_now)
 
-    s = sub.add_parser("start", help="Start service")
-    s.add_argument("name", nargs="?")
+    s = sub.add_parser("start", help="Start one or more services")
+    s.add_argument("targets", nargs="*", help="Service target(s): managed NAME and/or ID")
     s.add_argument("--name", dest="name_flag")
     s.add_argument("--id", dest="id_flag", type=int)
     s.set_defaults(func=lambda a: start_stop(a, "start"))
 
-    st = sub.add_parser("stop", help="Stop service")
-    st.add_argument("name", nargs="?")
+    st = sub.add_parser("stop", help="Stop one or more services")
+    st.add_argument("targets", nargs="*", help="Service target(s): managed NAME and/or ID")
     st.add_argument("--name", dest="name_flag")
     st.add_argument("--id", dest="id_flag", type=int)
     st.set_defaults(func=lambda a: start_stop(a, "stop"))
 
-    rs = sub.add_parser("restart", help="Restart service")
-    rs.add_argument("name", nargs="?")
+    rs = sub.add_parser("restart", help="Restart one or more services")
+    rs.add_argument("targets", nargs="*", help="Service target(s): managed NAME and/or ID")
     rs.add_argument("--name", dest="name_flag")
     rs.add_argument("--id", dest="id_flag", type=int)
     rs.set_defaults(func=restart)
