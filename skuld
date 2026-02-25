@@ -332,7 +332,8 @@ def resolve_lines_arg(args: argparse.Namespace, default: int = 100) -> int:
 
 
 def prompt_schedule_edit(current: str) -> str:
-    previous_hook = readline.get_startup_hook()
+    get_hook = getattr(readline, "get_startup_hook", None)
+    previous_hook = get_hook() if callable(get_hook) else None
     try:
         if current:
             readline.set_startup_hook(lambda: readline.insert_text(current))
