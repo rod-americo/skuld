@@ -259,7 +259,11 @@ skuld edit --name my-worker --exec "python /opt/app/new_worker.py"
 skuld edit my-worker --exec "python /opt/app/new_worker.py"
 skuld edit --name my-job --schedule "*-*-* 03:00:00"
 skuld edit --name my-job --clear-schedule
+skuld edit my-job --schedule
+skuld 3 --schedule
 ```
+
+`skuld edit <name|id> --schedule` (or `skuld <name|id> --schedule`) opens an interactive prompt with the current schedule prefilled for editing. Press `Enter` to apply the resulting value.
 
 ### Adopt an existing service
 

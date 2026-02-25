@@ -4,6 +4,7 @@ import json
 import os
 import pwd
 import re
+import readline
 import shlex
 import subprocess
 import sys
@@ -20,6 +21,7 @@ SKULD_HOME = Path(os.environ.get("SKULD_HOME", Path.home() / ".local/share/skuld
 REGISTRY_FILE = SKULD_HOME / "services.json"
 DEFAULT_ENV_FILE = Path(".env")
 USE_ENV_SUDO = True
+SCHEDULE_PROMPT_SENTINEL = "__SKULD_PROMPT_SCHEDULE__"
 
 
 @dataclass
@@ -327,6 +329,19 @@ def resolve_lines_arg(args: argparse.Namespace, default: int = 100) -> int:
     if lines_pos is not None:
         return lines_pos
     return default
+
+
+def prompt_schedule_edit(current: str) -> str:
+    previous_hook = readline.get_startup_hook()
+    try:
+        if current:
+            readline.set_startup_hook(lambda: readline.insert_text(current))
+        value = input("Schedule (OnCalendar): ").strip()
+    finally:
+        readline.set_startup_hook(previous_hook)
+    if value:
+        return value
+    return current
 
 
 def run(cmd: List[str], check: bool = True, capture: bool = False, input_text: Optional[str] = None) -> subprocess.CompletedProcess:
@@ -1217,6 +1232,9 @@ def edit(args: argparse.Namespace) -> None:
     name = svc.name
     require_systemctl()
     current = require_managed(name)
+    schedule = args.schedule
+    if schedule == SCHEDULE_PROMPT_SENTINEL and not args.clear_schedule:
+        schedule = prompt_schedule_edit(current.schedule)
 
     changed = apply_managed_update(
         current,
@@ -1225,7 +1243,7 @@ def edit(args: argparse.Namespace) -> None:
         working_dir=args.working_dir,
         user=args.user,
         restart=args.restart,
-        schedule=args.schedule,
+        schedule=schedule,
         timer_persistent=args.timer_persistent,
         clear_schedule=args.clear_schedule,
     )
@@ -1377,7 +1395,12 @@ def build_parser() -> argparse.ArgumentParser:
     ed.add_argument("--working-dir")
     ed.add_argument("--user")
     ed.add_argument("--restart")
-    ed.add_argument("--schedule")
+    ed.add_argument(
+        "--schedule",
+        nargs="?",
+        const=SCHEDULE_PROMPT_SENTINEL,
+        help="Timer OnCalendar expression. If omitted, opens interactive edit with current value.",
+    )
     ed.add_argument("--clear-schedule", action="store_true")
     ed.add_argument("--timer-persistent", action=argparse.BooleanOptionalAction, default=None)
     ed.set_defaults(func=edit)
@@ -1408,8 +1431,24 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     global USE_ENV_SUDO
+    argv = list(sys.argv)
+    known_commands = {"create", "list", "exec", "start", "stop", "restart", "status", "logs", "remove", "adopt", "doctor", "edit", "describe", "recreate", "sync", "version"}
+    edit_flags = {
+        "--exec",
+        "--description",
+        "--working-dir",
+        "--user",
+        "--restart",
+        "--schedule",
+        "--clear-schedule",
+        "--timer-persistent",
+        "--no-timer-persistent",
+    }
+    if len(argv) > 2 and not argv[1].startswith("-") and argv[1] not in known_commands:
+        if any(flag in argv[2:] for flag in edit_flags):
+            argv = [argv[0], "edit", argv[1], *argv[2:]]
     parser = build_parser()
-    args = parser.parse_args()
+    args = parser.parse_args(argv[1:])
     USE_ENV_SUDO = not args.no_env_sudo
     try:
         if getattr(args, "command", None) != "version":
