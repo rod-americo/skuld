@@ -989,6 +989,12 @@ def recreate(args: argparse.Namespace) -> None:
     sync_registry_from_systemd(name)
     svc = require_managed(name)
     print(build_recreate_command(svc))
+    if svc.user:
+        print()
+        print(
+            "# Note: with --user, Skuld also injects "
+            'Environment="HOME=...", "USER=...", "LOGNAME=...", and "PATH=..." in the generated unit.'
+        )
 
 
 def build_recreate_command(svc: ManagedService) -> str:
