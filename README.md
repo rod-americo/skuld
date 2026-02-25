@@ -101,6 +101,8 @@ Only services present in this file can be operated by:
 - `edit`
 - `sync --name <service>`
 
+On startup, Skuld normalizes this file automatically (canonical keys/order, pretty JSON, trailing newline, and valid unique IDs). This helps keep legacy or hand-edited registries consistent.
+
 ## Usage
 
 ### Create a service
@@ -112,6 +114,15 @@ skuld create \
   --working-dir /opt/app \
   --restart on-failure
 ```
+
+When `--user <name>` is provided, Skuld writes `User=<name>` and also injects:
+
+- `Environment="HOME=<user-home>"`
+- `Environment="USER=<name>"`
+- `Environment="LOGNAME=<name>"`
+- `Environment="PATH=<user-home>/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"`
+
+This avoids common runtime issues where services started by `systemd` miss user-scoped environment defaults and accidentally fall back to `/root`.
 
 ### Create a scheduled service (timer)
 

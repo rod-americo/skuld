@@ -2,6 +2,7 @@
 import argparse
 import json
 import os
+import pwd
 import re
 import shlex
 import subprocess
@@ -84,9 +85,53 @@ def get_sudo_password() -> Optional[str]:
 
 def load_registry() -> List[ManagedService]:
     ensure_storage()
-    data = json.loads(REGISTRY_FILE.read_text(encoding="utf-8"))
-    services = [ManagedService(**item) for item in data]
+    raw_text = REGISTRY_FILE.read_text(encoding="utf-8")
+    try:
+        data = json.loads(raw_text)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Invalid registry JSON at {REGISTRY_FILE}: {exc}") from exc
+    if not isinstance(data, list):
+        raise RuntimeError(f"Invalid registry format at {REGISTRY_FILE}: root must be an array.")
+
+    services: List[ManagedService] = []
     changed = False
+    known_keys = {
+        "name",
+        "exec_cmd",
+        "description",
+        "schedule",
+        "working_dir",
+        "user",
+        "restart",
+        "timer_persistent",
+        "id",
+    }
+    for idx, item in enumerate(data, start=1):
+        if not isinstance(item, dict):
+            raise RuntimeError(f"Invalid registry entry #{idx}: expected object.")
+        unknown = set(item.keys()) - known_keys
+        if unknown:
+            changed = True
+        normalized = {
+            "name": str(item.get("name", "")).strip(),
+            "exec_cmd": str(item.get("exec_cmd", "")).strip(),
+            "description": str(item.get("description", "")).strip(),
+            "schedule": str(item.get("schedule", "")).strip(),
+            "working_dir": str(item.get("working_dir", "")).strip(),
+            "user": str(item.get("user", "")).strip(),
+            "restart": str(item.get("restart", "on-failure")).strip() or "on-failure",
+            "timer_persistent": parse_bool(str(item.get("timer_persistent", True))),
+            "id": parse_int(str(item.get("id", 0))),
+        }
+        if not normalized["name"] or not normalized["exec_cmd"] or not normalized["description"]:
+            raise RuntimeError(
+                f"Invalid registry entry #{idx}: fields 'name', 'exec_cmd' and 'description' are required."
+            )
+        validate_name(normalized["name"])
+        if normalized != {k: item.get(k) for k in known_keys if k in item}:
+            changed = True
+        services.append(ManagedService(**normalized))
+
     used_ids = set()
     next_id = 1
     for svc in services:
@@ -96,17 +141,19 @@ def load_registry() -> List[ManagedService]:
             svc.id = next_id
             changed = True
         used_ids.add(svc.id)
-    if changed:
-        save_registry(services)
-    return services
+    normalized_services = sorted(services, key=lambda s: (s.name.lower(), s.id))
+    if normalized_services != services:
+        changed = True
+    canonical_text = json.dumps([asdict(s) for s in normalized_services], indent=2, ensure_ascii=False) + "\n"
+    if changed or raw_text != canonical_text:
+        REGISTRY_FILE.write_text(canonical_text, encoding="utf-8")
+    return normalized_services
 
 
 def save_registry(services: List[ManagedService]) -> None:
     ensure_storage()
-    REGISTRY_FILE.write_text(
-        json.dumps([asdict(s) for s in services], indent=2, ensure_ascii=False),
-        encoding="utf-8",
-    )
+    ordered = sorted(services, key=lambda s: (s.name.lower(), s.id))
+    REGISTRY_FILE.write_text(json.dumps([asdict(s) for s in ordered], indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
 
 def upsert_registry(service: ManagedService) -> None:
@@ -685,9 +732,36 @@ def write_systemd_file(target: str, content: str) -> None:
         Path(tmp_path).unlink(missing_ok=True)
 
 
+def systemd_env_quote(value: str) -> str:
+    return value.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def infer_home_for_user(user: str) -> str:
+    try:
+        return pwd.getpwnam(user).pw_dir
+    except KeyError:
+        return f"/home/{user}"
+
+
+def render_user_environment(user: str) -> str:
+    if not user:
+        return ""
+    home = infer_home_for_user(user)
+    home_q = systemd_env_quote(home)
+    user_q = systemd_env_quote(user)
+    path_q = systemd_env_quote(f"{home}/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
+    return (
+        f'Environment="HOME={home_q}"\n'
+        f'Environment="USER={user_q}"\n'
+        f'Environment="LOGNAME={user_q}"\n'
+        f'Environment="PATH={path_q}"\n'
+    )
+
+
 def render_service(name: str, description: str, exec_cmd: str, working_dir: str, user: str, restart: str) -> str:
     wd_line = f"WorkingDirectory={working_dir}\n" if working_dir else ""
     user_line = f"User={user}\n" if user else ""
+    env_lines = render_user_environment(user)
     return (
         "[Unit]\n"
         f"Description={description}\n"
@@ -696,7 +770,7 @@ def render_service(name: str, description: str, exec_cmd: str, working_dir: str,
         "Type=simple\n"
         f"ExecStart=/bin/bash -lc {shlex.quote(exec_cmd)}\n"
         f"Restart={restart}\n"
-        f"{user_line}{wd_line}"
+        f"{user_line}{env_lines}{wd_line}"
         "\n"
         "[Install]\n"
         "WantedBy=multi-user.target\n"
@@ -1332,6 +1406,8 @@ def main() -> int:
     args = parser.parse_args()
     USE_ENV_SUDO = not args.no_env_sudo
     try:
+        if getattr(args, "command", None) != "version":
+            load_registry()
         if not getattr(args, "command", None):
             list_services(argparse.Namespace())
             print("Quick help: skuld <id|name> commands: exec/start/stop/restart/status/logs/describe/edit/remove")
