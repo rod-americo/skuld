@@ -1,6 +1,6 @@
 # Skuld
 
-Skuld is a Python CLI/TUI for creating and managing `systemd` services and timers with a local registry.
+Skuld is a Python CLI for creating and managing `systemd` services and timers with a local registry.
 
 It is designed to monitor only services that were created or explicitly adopted by Skuld.
 
@@ -27,8 +27,7 @@ It watches only what you intentionally place in its care, then makes sure those 
 - Run `doctor` checks to detect registry/unit mismatches.
 - Backfill missing registry fields from systemd with `skuld sync`.
 - Generate an equivalent `skuld create` command from an existing managed service with `skuld recreate`.
-- Show CPU, memory, GPU memory, and listening ports in `skuld list` and in the TUI table.
-- Lightweight terminal UI (`skuld tui`) for quick operations.
+- Show CPU, memory, GPU memory, and listening ports in `skuld list`.
 
 ## Requirements
 
@@ -278,33 +277,6 @@ skuld sync my-worker
 skuld remove --name my-worker
 skuld remove --name my-worker --purge
 ```
-
-### TUI
-
-```bash
-skuld tui
-```
-
-TUI keys:
-
-- `q`: quit
-- `r`: refresh
-- `j`/`k` or arrows: navigate
-- `Enter`: open service details panel
-- `e`: execute now
-- `s`: start
-- `t`: stop
-- `R`: restart
-- `d`: show description hint
-
-Inside details panel:
-
-- `q`: back to list
-- `e`: edit `exec` command
-- `c`: edit/clear `schedule`
-- `r`: show `recreate` command
-- `x`: execute immediately
-- `s` / `t` / `R`: start, stop, restart
 
 ## Command Help
 
