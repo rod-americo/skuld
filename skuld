@@ -647,6 +647,28 @@ def read_timer_persistent(name: str, default: bool = True) -> bool:
     return default
 
 
+def read_timer_next_run(name: str) -> str:
+    timer_unit = f"{name}.timer"
+    if not unit_exists(timer_unit):
+        return "-"
+    show = systemctl_show(timer_unit, ["NextElapseUSecRealtime"])
+    value = (show.get("NextElapseUSecRealtime", "") or "").strip()
+    if not value or value.lower() == "n/a":
+        return "-"
+    return value
+
+
+def read_timer_last_run(name: str) -> str:
+    timer_unit = f"{name}.timer"
+    if not unit_exists(timer_unit):
+        return "-"
+    show = systemctl_show(timer_unit, ["LastTriggerUSec"])
+    value = (show.get("LastTriggerUSec", "") or "").strip()
+    if not value or value.lower() == "n/a":
+        return "-"
+    return value
+
+
 def schedule_for_display(svc: ManagedService) -> str:
     if svc.schedule:
         return svc.schedule
@@ -832,10 +854,12 @@ def create(args: argparse.Namespace) -> None:
         write_systemd_file(timer_file, timer_content)
 
     run_sudo(["systemctl", "daemon-reload"])
-    run_sudo(["systemctl", "enable", f"{args.name}.service"])
-
     if args.schedule:
+        # Timer jobs should be enabled via .timer only.
+        run_sudo(["systemctl", "disable", f"{args.name}.service"], check=False)
         run_sudo(["systemctl", "enable", "--now", f"{args.name}.timer"])
+    else:
+        run_sudo(["systemctl", "enable", f"{args.name}.service"])
 
     upsert_registry(
         ManagedService(
@@ -892,6 +916,8 @@ def list_services(_args: argparse.Namespace) -> None:
                 kind,
                 s_state,
                 t_state,
+                read_timer_next_run(svc.name),
+                read_timer_last_run(svc.name),
                 schedule,
                 usage["cpu"],
                 usage["memory"],
@@ -900,7 +926,7 @@ def list_services(_args: argparse.Namespace) -> None:
             ]
         )
     render_table(
-        ["id", "name", "kind", "service", "timer", "schedule", "cpu", "memory", "gpu", "ports"],
+        ["id", "name", "kind", "service", "timer", "next_run", "last_run", "schedule", "cpu", "memory", "gpu", "ports"],
         rows,
     )
     print()
@@ -925,11 +951,23 @@ def apply_action_for_managed(svc: ManagedService, action: str) -> None:
     uses_timer = managed_uses_timer(svc)
 
     if uses_timer:
-        run_sudo(["systemctl", action, timer_unit], check=False)
+        proc = run_sudo(["systemctl", action, timer_unit], check=False, capture=True)
+        if proc.returncode != 0:
+            details = (proc.stderr or proc.stdout or "").strip()
+            msg = f"Failed to {action} {timer_unit}."
+            if details:
+                msg = f"{msg} {details}"
+            raise RuntimeError(msg)
         ok(f"{action} -> {timer_unit}")
         return
 
-    run_sudo(["systemctl", action, service_unit], check=False)
+    proc = run_sudo(["systemctl", action, service_unit], check=False, capture=True)
+    if proc.returncode != 0:
+        details = (proc.stderr or proc.stdout or "").strip()
+        msg = f"Failed to {action} {service_unit}."
+        if details:
+            msg = f"{msg} {details}"
+        raise RuntimeError(msg)
     ok(f"{action} -> {service_unit}")
 
 
@@ -1208,9 +1246,13 @@ def apply_managed_update(
         run_sudo(["rm", "-f", timer_path], check=False)
 
     run_sudo(["systemctl", "daemon-reload"])
-    run_sudo(["systemctl", "enable", f"{name}.service"], check=False)
     if new_schedule:
+        # Timer jobs should be enabled via .timer only.
+        run_sudo(["systemctl", "disable", f"{name}.service"], check=False)
         run_sudo(["systemctl", "enable", f"{name}.timer"], check=False)
+    else:
+        run_sudo(["systemctl", "enable", f"{name}.service"], check=False)
+        run_sudo(["systemctl", "disable", f"{name}.timer"], check=False)
 
     upsert_registry(
         ManagedService(

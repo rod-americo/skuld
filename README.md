@@ -199,7 +199,7 @@ For timer jobs and daemons, action routing is automatic:
 skuld list
 ```
 
-`skuld list` output includes: `id | name | kind | service | timer | schedule | cpu | memory | gpu | ports`.
+`skuld list` output includes: `id | name | kind | service | timer | next_run | last_run | schedule | cpu | memory | gpu | ports`.
 
 ### Execute immediately
 
