@@ -19,11 +19,13 @@ ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 SHELL_SAFE_RE = re.compile(r"^[A-Za-z0-9_@%+=:,./-]+$")
 SKULD_HOME = Path(os.environ.get("SKULD_HOME", Path.home() / ".local/share/skuld"))
 REGISTRY_FILE = SKULD_HOME / "services.json"
+RUNTIME_STATS_FILE = Path(os.environ.get("SKULD_RUNTIME_STATS_FILE", "/var/lib/skuld/journal_stats.json"))
 DEFAULT_ENV_FILE = Path(".env")
 USE_ENV_SUDO = True
 FORCE_TABLE_ASCII = False
 FORCE_TABLE_UNICODE = False
 SCHEDULE_PROMPT_SENTINEL = "__SKULD_PROMPT_SCHEDULE__"
+SYSTEMD_UNIT_STARTED_MESSAGE_ID = "39f53479d3a045ac8e11786248231fbf"
 
 
 @dataclass
@@ -391,6 +393,14 @@ def run_sudo(cmd: List[str], check: bool = True, capture: bool = False) -> subpr
     return run(full, check=check, capture=capture)
 
 
+def journal_permission_hint(stderr_text: str) -> bool:
+    lower = stderr_text.lower()
+    return (
+        "not seeing messages from other users and the system" in lower
+        or "permission denied" in lower
+    )
+
+
 def require_systemctl() -> None:
     try:
         run(["systemctl", "--version"], check=True, capture=True)
@@ -453,6 +463,63 @@ def format_cpu_nsec(value: str) -> str:
     hours = int(minutes // 60)
     rem_min = minutes % 60
     return f"{hours}h{rem_min}m"
+
+
+def format_duration_human(seconds: int) -> str:
+    if seconds < 0:
+        return "-"
+    days, rem = divmod(seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, _ = divmod(rem, 60)
+    if days > 0:
+        return f"{days}d {hours:02d}h {minutes:02d}m"
+    if hours > 0:
+        return f"{hours}h {minutes:02d}m"
+    return f"{minutes}m"
+
+
+def read_host_overview() -> Dict[str, str]:
+    uptime = "-"
+    try:
+        raw = Path("/proc/uptime").read_text(encoding="utf-8").split()[0]
+        uptime = format_duration_human(int(float(raw)))
+    except Exception:
+        pass
+
+    cpu = "-"
+    try:
+        load1, load5, load15 = os.getloadavg()
+        cores = max(1, os.cpu_count() or 1)
+        load_pct = int((load1 / cores) * 100)
+        cpu = f"{load1:.2f} {load5:.2f} {load15:.2f} ({load_pct}%)"
+    except Exception:
+        pass
+
+    memory = "-"
+    try:
+        meminfo: Dict[str, int] = {}
+        for raw in Path("/proc/meminfo").read_text(encoding="utf-8").splitlines():
+            if ":" not in raw:
+                continue
+            key, val = raw.split(":", 1)
+            tokens = val.strip().split()
+            if not tokens:
+                continue
+            meminfo[key.strip()] = int(tokens[0]) * 1024  # kB -> bytes
+        total = meminfo.get("MemTotal", 0)
+        available = meminfo.get("MemAvailable", 0)
+        used = max(0, total - available)
+        if total > 0:
+            pct = int((used / total) * 100)
+            memory = f"{format_bytes(str(used))}/{format_bytes(str(total))} ({pct}%)"
+    except Exception:
+        pass
+
+    return {
+        "uptime": uptime,
+        "cpu(load1/5/15)": cpu,
+        "memory": memory,
+    }
 
 
 def parse_int(value: str) -> int:
@@ -648,6 +715,43 @@ def render_table(headers: List[str], rows: List[List[str]]) -> None:
     for row in rows:
         print(format_row(row))
     print(hline(box["bottom_left"], box["bottom_mid"], box["bottom_right"], box["fill"]))
+
+
+def render_host_panel() -> None:
+    overview = read_host_overview()
+    render_table(list(overview.keys()), [list(overview.values())])
+    print()
+
+
+def load_runtime_stats() -> Dict[str, Dict[str, int]]:
+    try:
+        data = json.loads(RUNTIME_STATS_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    services = data.get("services")
+    if not isinstance(services, dict):
+        return {}
+
+    normalized: Dict[str, Dict[str, int]] = {}
+    for name, item in services.items():
+        if not isinstance(name, str) or not isinstance(item, dict):
+            continue
+        executions = parse_int(str(item.get("executions", 0)))
+        restarts = parse_int(str(item.get("restarts", 0)))
+        normalized[name] = {
+            "executions": max(0, executions),
+            "restarts": max(0, restarts),
+        }
+    return normalized
+
+
+def format_restarts_exec(name: str, runtime_stats: Dict[str, Dict[str, int]]) -> str:
+    item = runtime_stats.get(name)
+    if not item:
+        return "-"
+    return f"{item.get('restarts', 0)}/{item.get('executions', 0)}"
 
 
 def clip_text(text: str, width: int) -> str:
@@ -935,7 +1039,9 @@ def list_services(_args: argparse.Namespace) -> None:
 
     rows: List[List[str]] = []
     gpu_memory_by_pid = read_gpu_memory_by_pid()
+    runtime_stats = load_runtime_stats()
     print()
+    render_host_panel()
     for svc in services:
         s_unit = f"{svc.name}.service"
         t_unit = f"{svc.name}.timer"
@@ -966,6 +1072,7 @@ def list_services(_args: argparse.Namespace) -> None:
                 s_state,
                 t_state,
                 read_timer_next_run(svc.name),
+                format_restarts_exec(svc.name, runtime_stats),
                 read_timer_last_run(svc.name),
                 schedule,
                 usage["cpu"],
@@ -975,7 +1082,7 @@ def list_services(_args: argparse.Namespace) -> None:
             ]
         )
     render_table(
-        ["id", "name", "kind", "service", "timer", "next_run", "last_run", "schedule", "cpu", "memory", "gpu", "ports"],
+        ["id", "name", "kind", "service", "timer", "next_run", "r/e", "last_run", "schedule", "cpu", "memory", "gpu", "ports"],
         rows,
     )
     print()
@@ -990,10 +1097,14 @@ def list_services_compact() -> None:
         return
 
     rows: List[List[str]] = []
+    runtime_stats = load_runtime_stats()
     print()
+    render_host_panel()
     for svc in services:
         s_unit = f"{svc.name}.service"
+        t_unit = f"{svc.name}.timer"
         s_state_raw = unit_active(s_unit) if unit_exists(s_unit) else "missing"
+        t_state_raw = unit_active(t_unit) if unit_exists(t_unit) else "n/a"
         schedule = schedule_for_display(svc) or "-"
         kind = "timer" if schedule != "-" else "daemon"
         if s_state_raw == "active":
@@ -1002,9 +1113,17 @@ def list_services_compact() -> None:
             s_state = colorize("inactive", "yellow")
         else:
             s_state = colorize(s_state_raw, "red")
+        if t_state_raw == "active":
+            t_state = colorize("active", "green")
+        elif t_state_raw == "inactive":
+            t_state = colorize("inactive", "yellow")
+        elif t_state_raw == "n/a":
+            t_state = colorize("n/a", "gray")
+        else:
+            t_state = colorize(t_state_raw, "red")
         next_run = read_timer_next_run(svc.name) if kind == "timer" else "-"
-        rows.append([str(svc.id), svc.name, kind, s_state, next_run])
-    render_table(["id", "name", "kind", "service", "next_run"], rows)
+        rows.append([str(svc.id), svc.name, kind, s_state, t_state, format_restarts_exec(svc.name, runtime_stats), next_run])
+    render_table(["id", "name", "kind", "service", "timer", "r/e", "next_run"], rows)
     print()
 
 
@@ -1098,10 +1217,7 @@ def logs(args: argparse.Namespace) -> None:
     stderr = (proc.stderr or "").strip()
     stdout = (proc.stdout or "").strip()
 
-    permission_hint = (
-        "not seeing messages from other users and the system" in stderr.lower()
-        or "permission denied" in stderr.lower()
-    )
+    permission_hint = journal_permission_hint(stderr)
     if permission_hint:
         proc = run_sudo(cmd, check=False, capture=True)
         stderr = (proc.stderr or "").strip()
@@ -1111,6 +1227,63 @@ def logs(args: argparse.Namespace) -> None:
         print(stdout)
     if stderr:
         print(stderr, file=sys.stderr)
+
+
+def count_unit_starts(unit: str, since: Optional[str] = None, boot: bool = False) -> int:
+    cmd = [
+        "journalctl",
+        "-u",
+        unit,
+        f"MESSAGE_ID={SYSTEMD_UNIT_STARTED_MESSAGE_ID}",
+        "-o",
+        "json",
+        "--no-pager",
+    ]
+    if since:
+        cmd.extend(["--since", since])
+    if boot:
+        cmd.append("-b")
+
+    proc = run(cmd, check=False, capture=True)
+    stderr = (proc.stderr or "").strip()
+    stdout = proc.stdout or ""
+    if journal_permission_hint(stderr):
+        proc = run_sudo(cmd, check=False, capture=True)
+        stderr = (proc.stderr or "").strip()
+        stdout = proc.stdout or ""
+
+    lines = [line for line in stdout.splitlines() if line.strip()]
+    return len(lines)
+
+
+def read_restart_count(name: str) -> str:
+    service_unit = f"{name}.service"
+    if not unit_exists(service_unit):
+        return "-"
+    show = systemctl_show(service_unit, ["NRestarts"])
+    raw = (show.get("NRestarts", "") or "").strip()
+    return raw if raw else "-"
+
+
+def stats(args: argparse.Namespace) -> None:
+    svc = resolve_managed_arg(args)
+    name = svc.name
+    require_systemctl()
+    sync_registry_from_systemd(name)
+    service_unit = f"{name}.service"
+    executions = count_unit_starts(service_unit, since=args.since, boot=args.boot)
+    restarts = read_restart_count(name)
+
+    print(f"name: {name}")
+    print(f"service_unit: {service_unit}")
+    if args.boot:
+        print("window: current boot")
+    elif args.since:
+        print(f"window: since {args.since}")
+    else:
+        print("window: all retained journal entries")
+    print(f"executions: {executions}")
+    print(f"restarts: {restarts}")
 
 
 def recreate(args: argparse.Namespace) -> None:
@@ -1492,6 +1665,14 @@ def build_parser() -> argparse.ArgumentParser:
     lg.add_argument("--plain", action="store_true", help="Shortcut for --output cat (message only)")
     lg.set_defaults(func=logs)
 
+    stt = sub.add_parser("stats", help="Show execution/restart counters for a managed service")
+    stt.add_argument("name", nargs="?")
+    stt.add_argument("--name", dest="name_flag")
+    stt.add_argument("--id", dest="id_flag", type=int)
+    stt.add_argument("--since", help="journalctl time filter (example: '24 hours ago')")
+    stt.add_argument("--boot", action="store_true", help="Count entries from current boot only")
+    stt.set_defaults(func=stats)
+
     rm = sub.add_parser("remove", help="Remove units")
     rm.add_argument("name", nargs="?")
     rm.add_argument("--name", dest="name_flag")
@@ -1553,7 +1734,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> int:
     global USE_ENV_SUDO, FORCE_TABLE_ASCII, FORCE_TABLE_UNICODE
     argv = list(sys.argv)
-    known_commands = {"create", "list", "exec", "start", "stop", "restart", "status", "logs", "remove", "adopt", "doctor", "edit", "describe", "recreate", "sync", "version"}
+    known_commands = {"create", "list", "exec", "start", "stop", "restart", "status", "logs", "stats", "remove", "adopt", "doctor", "edit", "describe", "recreate", "sync", "version"}
     edit_flags = {
         "--exec",
         "--description",
@@ -1580,7 +1761,7 @@ def main() -> int:
             load_registry()
         if not getattr(args, "command", None):
             list_services_compact()
-            print("Quick help: skuld <id|name> commands: exec/start/stop/restart/status/logs/describe/edit/remove")
+            print("Quick help: skuld <id|name> commands: exec/start/stop/restart/status/logs/stats/describe/edit/remove")
             print()
             return 0
 

@@ -18,6 +18,11 @@ That symbolism maps directly to this project.
 Skuld does not try to manage everything in your system.
 It watches only what you intentionally place in its care, then makes sure those future actions remain visible, repeatable, and accountable.
 
+## Why Skuld in the AI era
+
+AI can help you generate service files and commands faster, but operational clarity still needs a stable control plane.
+Skuld provides that local control layer: explicit ownership, predictable lifecycle commands, and an auditable view of what you chose to run.
+
 ## Features
 
 - Create `.service` units and optional `.timer` units.
@@ -201,12 +206,21 @@ skuld list
 ```
 
 - `skuld` (without subcommands) shows a compact view:
-  `id | name | kind | service | next_run`
+  `id | name | kind | service | timer | r/e | next_run`
 - `skuld list` shows the full view:
-  `id | name | kind | service | timer | next_run | last_run | schedule | cpu | memory | gpu | ports`
+  `id | name | kind | service | timer | next_run | r/e | last_run | schedule | cpu | memory | gpu | ports`
+- Both views include a top host panel with:
+  `uptime | cpu(load1/5/15) | memory`
+- `r/e` means `restarts/executions` since last boot (from runtime stats JSON).
 - Table borders use Unicode automatically when supported by your terminal. You can override:
   - `skuld --ascii`
   - `skuld --unicode`
+
+To enable `r/e` collection every minute via `systemd` (outside the Skuld registry), run:
+
+```bash
+./scripts/install_runtime_stats_timer.sh --registry "$HOME/.local/share/skuld/services.json"
+```
 
 ### Execute immediately
 
@@ -241,6 +255,16 @@ skuld logs 3 --output short-iso
 ```
 
 `--plain` uses `journalctl -o cat` (message only, no timestamp/host/process prefix).
+
+### Execution stats
+
+Use journal extraction to count service executions and `systemd` counters for restarts.
+
+```bash
+skuld stats --name my-worker
+skuld stats my-worker --since "24 hours ago"
+skuld stats my-worker --boot
+```
 
 ### Describe
 
