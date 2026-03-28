@@ -130,7 +130,7 @@ skuld create \
   --restart on-failure
 ```
 
-On macOS, Skuld defaults to `--scope daemon`, which maps to `LaunchDaemon` and is the right default for server-style machines.
+On macOS, Skuld defaults to `--scope agent`, which maps to `LaunchAgent` and is the right default for user-owned services living under `~/...`.
 
 To create a user-scoped job explicitly:
 
@@ -150,7 +150,7 @@ On Linux, when `--user <name>` is provided, Skuld writes `User=<name>` and also 
 
 This avoids common runtime issues where services started by `systemd` miss user-scoped environment defaults and accidentally fall back to `/root`.
 
-On macOS, `--user` is valid only with `--scope daemon`.
+On macOS, `--user` is not supported. Prefer `--scope agent` for per-user services. Use `--scope daemon` only for system-level jobs that should run without a user identity.
 
 ### Create a scheduled service (timer)
 

@@ -50,7 +50,7 @@ class ManagedService:
     timer_persistent: bool = True
     id: int = 0
     backend: str = "launchd"
-    scope: str = "daemon"
+    scope: str = "agent"
     log_dir: str = ""
 
 
@@ -124,7 +124,7 @@ def validate_name(name: str) -> None:
 
 
 def resolve_scope(value: str) -> str:
-    scope = (value or "daemon").strip().lower()
+    scope = (value or "agent").strip().lower()
     if scope not in {"daemon", "agent"}:
         raise RuntimeError("Invalid scope. Use 'daemon' or 'agent'.")
     return scope
@@ -561,8 +561,11 @@ def resolve_lines_arg(args: argparse.Namespace, default: int = 100) -> int:
 
 
 def require_supported_scope_user(scope: str, user: str) -> None:
-    if scope == "agent" and user:
-        raise RuntimeError("--user is only supported with --scope daemon on macOS.")
+    if user:
+        raise RuntimeError(
+            "--user is not supported on macOS. Use --scope agent for per-user services "
+            "or omit --user for system daemons."
+        )
 
 
 def ensure_directory(path: Path, scope: str) -> None:
@@ -1174,7 +1177,7 @@ def _render_services_table(compact: bool) -> None:
         pid = read_pid(service)
         usage = read_cpu_memory(pid)
         loaded = service_loaded(service)
-        kind = "timer" if service.schedule else "daemon"
+        kind = "timer" if service.schedule else service.scope
         if loaded and pid > 0:
             service_state = colorize("active", "green")
         elif loaded:
@@ -1350,6 +1353,9 @@ def apply_managed_update(
     if asdict(updated) == asdict(current):
         return False
     bootout_service(current)
+    if current.scope != updated.scope:
+        rm_file(plist_path_for_service(current), current.scope)
+        rm_file(wrapper_script_for_service(current.name, current.scope), current.scope)
     install_service_files(updated)
     bootstrap_service(updated)
     upsert_registry(updated)
@@ -1440,7 +1446,7 @@ def build_parser() -> argparse.ArgumentParser:
     create_parser.add_argument("--restart", default="on-failure")
     create_parser.add_argument("--schedule", help="Supported subset of systemd-like schedule expressions")
     create_parser.add_argument("--timer-persistent", action=argparse.BooleanOptionalAction, default=True)
-    create_parser.add_argument("--scope", choices=["daemon", "agent"], default="daemon")
+    create_parser.add_argument("--scope", choices=["daemon", "agent"], default="agent")
     create_parser.set_defaults(func=create)
 
     list_parser = sub.add_parser("list", help="List services managed by skuld")
