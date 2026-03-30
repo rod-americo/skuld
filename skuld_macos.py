@@ -11,6 +11,7 @@ import shlex
 import subprocess
 import sys
 import tempfile
+import threading
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
@@ -1069,7 +1070,10 @@ def tail_file(path: Path, lines: int, follow: bool) -> None:
     if follow:
         cmd.append("-f")
     cmd.append(str(path))
-    run(cmd, check=False)
+    try:
+        run(cmd, check=False)
+    except KeyboardInterrupt:
+        return
 
 
 def logs(args: argparse.Namespace) -> None:
@@ -1088,12 +1092,29 @@ def logs(args: argparse.Namespace) -> None:
         print("No logs found.")
         return
     print(f"==> {stdout_path}")
+    if args.follow:
+        workers: List[threading.Thread] = []
+        if stdout_path.exists():
+            workers.append(threading.Thread(target=tail_file, args=(stdout_path, lines, True), daemon=True))
+        print()
+        print(f"==> {stderr_path}")
+        if stderr_path.exists():
+            workers.append(threading.Thread(target=tail_file, args=(stderr_path, lines, True), daemon=True))
+        for worker in workers:
+            worker.start()
+        try:
+            for worker in workers:
+                worker.join()
+        except KeyboardInterrupt:
+            return
+        return
+
     if stdout_path.exists():
-        tail_file(stdout_path, lines, args.follow)
+        tail_file(stdout_path, lines, False)
     print()
     print(f"==> {stderr_path}")
     if stderr_path.exists():
-        tail_file(stderr_path, lines, args.follow)
+        tail_file(stderr_path, lines, False)
 
 
 def read_cpu_memory(pid: int) -> Dict[str, str]:
