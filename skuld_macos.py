@@ -9,10 +9,12 @@ import readline
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
@@ -690,6 +692,45 @@ def read_process_tree_pids(root_pid: int) -> List[int]:
     return sorted(seen)
 
 
+def terminate_process_tree(root_pid: int, grace_seconds: float = 2.0) -> None:
+    pids = read_process_tree_pids(root_pid)
+    if not pids:
+        return
+
+    ordered = sorted(pids, reverse=True)
+
+    for pid in ordered:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            continue
+        except PermissionError:
+            continue
+
+    deadline = time.time() + max(0.1, grace_seconds)
+    while time.time() < deadline:
+        alive = []
+        for pid in ordered:
+            try:
+                os.kill(pid, 0)
+                alive.append(pid)
+            except ProcessLookupError:
+                continue
+            except PermissionError:
+                alive.append(pid)
+        if not alive:
+            return
+        time.sleep(0.1)
+
+    for pid in ordered:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            continue
+        except PermissionError:
+            continue
+
+
 def restart_policy_to_keepalive(value: str) -> object:
     policy = (value or "on-failure").strip().lower()
     if policy in {"no", "never"}:
@@ -843,6 +884,37 @@ def update_runtime_stats(service: ManagedService) -> Dict[str, Dict[str, object]
     return services
 
 
+def read_service_events(service: ManagedService) -> List[Dict[str, object]]:
+    path = event_file_for_service(service.name, service.scope)
+    if not path.exists():
+        return []
+    events: List[Dict[str, object]] = []
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        try:
+            item = json.loads(line)
+        except Exception:
+            continue
+        if isinstance(item, dict):
+            events.append(item)
+    return events
+
+
+def read_recent_run_root_pids(service: ManagedService, limit: int = 3) -> List[int]:
+    starts = []
+    for item in read_service_events(service):
+        if str(item.get("event")) != "start":
+            continue
+        pid = parse_int(str(item.get("child_pid", item.get("pid", 0))))
+        if pid > 0:
+            starts.append(pid)
+    if not starts:
+        return []
+    return list(reversed(starts[-max(1, limit):]))
+
+
 def format_restarts_exec(service: ManagedService, runtime_stats: Dict[str, Dict[str, object]]) -> str:
     item = runtime_stats.get(service.name)
     if not item:
@@ -873,10 +945,21 @@ def build_wrapper_script(service: ManagedService) -> str:
         ': > "$STDERR_LOG"\n'
         'ln -sfn "$STDOUT_LOG" "$LOG_DIR/stdout.log"\n'
         'ln -sfn "$STDERR_LOG" "$LOG_DIR/stderr.log"\n'
-        'printf \'{"ts":"%s","event":"start","pid":%s,"stdout_log":"%s","stderr_log":"%s"}\\n\' "$ts_start" "$$" "$STDOUT_LOG" "$STDERR_LOG" >> "$EVENT_FILE"\n'
         "exit_code=0\n"
-        f"/bin/zsh -lc {cmd} >> \"$STDOUT_LOG\" 2>> \"$STDERR_LOG\"\n"
+        "child_pid=''\n"
+        "cleanup() {\n"
+        "  if [[ -n \"$child_pid\" ]]; then\n"
+        "    kill -TERM \"$child_pid\" >/dev/null 2>&1 || true\n"
+        "    wait \"$child_pid\" >/dev/null 2>&1 || true\n"
+        "  fi\n"
+        "}\n"
+        "trap cleanup TERM INT EXIT\n"
+        f"/bin/zsh -lc {cmd} >> \"$STDOUT_LOG\" 2>> \"$STDERR_LOG\" &\n"
+        "child_pid=$!\n"
+        'printf \'{"ts":"%s","event":"start","pid":%s,"child_pid":%s,"stdout_log":"%s","stderr_log":"%s"}\\n\' "$ts_start" "$$" "$child_pid" "$STDOUT_LOG" "$STDERR_LOG" >> "$EVENT_FILE"\n'
+        "wait \"$child_pid\"\n"
         "exit_code=$?\n"
+        "trap - TERM INT EXIT\n"
         "ts_end=$(date -u +%Y-%m-%dT%H:%M:%SZ)\n"
         'printf \'{"ts":"%s","event":"end","exit_status":%s}\\n\' "$ts_end" "$exit_code" >> "$EVENT_FILE"\n'
         "exit \"$exit_code\"\n"
@@ -1032,11 +1115,23 @@ def apply_action_for_managed(service: ManagedService, action: str) -> None:
         ok(f"start -> {service.name}")
         return
     if action == "stop":
+        pid = read_pid(service)
+        extra_pids = read_recent_run_root_pids(service)
         bootout_service(service)
+        terminate_process_tree(pid)
+        for extra_pid in extra_pids:
+            if extra_pid != pid:
+                terminate_process_tree(extra_pid)
         ok(f"stop -> {service.name}")
         return
     if action == "restart":
+        pid = read_pid(service)
+        extra_pids = read_recent_run_root_pids(service)
         bootout_service(service)
+        terminate_process_tree(pid)
+        for extra_pid in extra_pids:
+            if extra_pid != pid:
+                terminate_process_tree(extra_pid)
         bootstrap_service(service)
         if not managed_uses_schedule(service):
             proc = kickstart_service(service, kill_existing=True)
