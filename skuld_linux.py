@@ -43,6 +43,14 @@ class ManagedService:
     id: int = 0
 
 
+@dataclass
+class DiscoverableService:
+    index: int
+    name: str
+    service_state: str
+    timer_state: str
+
+
 def ensure_storage() -> None:
     SKULD_HOME.mkdir(parents=True, exist_ok=True)
     if not REGISTRY_FILE.exists():
@@ -332,6 +340,8 @@ def normalize_service_name(value: str) -> str:
     raw = (value or "").strip()
     if raw.endswith(".service"):
         raw = raw[:-8]
+    elif raw.endswith(".timer"):
+        raw = raw[:-6]
     validate_name(raw)
     return raw
 
@@ -1173,6 +1183,95 @@ def systemctl_cat(unit: str) -> str:
     return proc.stdout or ""
 
 
+def list_discoverable_services() -> List[DiscoverableService]:
+    require_systemctl()
+    proc = run(
+        ["systemctl", "list-unit-files", "--type=service", "--type=timer", "--no-legend", "--no-pager"],
+        check=False,
+        capture=True,
+    )
+    discovered: Dict[str, Dict[str, str]] = {}
+    for raw in (proc.stdout or "").splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        unit_name = parts[0].strip()
+        state = parts[1].strip()
+        if unit_name.endswith(".service"):
+            base_name = unit_name[:-8]
+            kind = "service"
+        elif unit_name.endswith(".timer"):
+            base_name = unit_name[:-6]
+            kind = "timer"
+        else:
+            continue
+        if not NAME_RE.match(base_name):
+            continue
+        entry = discovered.setdefault(base_name, {"service": "", "timer": ""})
+        entry[kind] = state
+
+    names = sorted(name for name, states in discovered.items() if states.get("service"))
+    result: List[DiscoverableService] = []
+    for idx, name in enumerate(names, start=1):
+        states = discovered[name]
+        result.append(
+            DiscoverableService(
+                index=idx,
+                name=name,
+                service_state=states.get("service", "") or "-",
+                timer_state=states.get("timer", "") or "n/a",
+            )
+        )
+    return result
+
+
+def render_discoverable_services_hint() -> None:
+    print("No services tracked by skuld.")
+    entries = list_discoverable_services()
+    if not entries:
+        print("No systemd services were found.")
+        return
+    print("Available systemd services:")
+    for entry in entries:
+        print(f"  {entry.index}. {entry.name}  service={entry.service_state}  timer={entry.timer_state}")
+    print()
+    print("Use: skuld track <id ...> or skuld track <service ...>")
+
+
+def resolve_discoverable_targets(targets: List[str]) -> List[DiscoverableService]:
+    entries = list_discoverable_services()
+    by_index = {entry.index: entry for entry in entries}
+    by_name = {entry.name: entry for entry in entries}
+    resolved: List[DiscoverableService] = []
+    seen: Set[str] = set()
+    for raw_target in targets:
+        token = (raw_target or "").strip()
+        if not token:
+            continue
+        entry: Optional[DiscoverableService]
+        if token.isdigit():
+            entry = by_index.get(int(token))
+            if not entry:
+                raise RuntimeError(f"Catalog id '{token}' not found.")
+        else:
+            name = normalize_service_name(token)
+            entry = by_name.get(name)
+            if not entry:
+                if not unit_exists(f"{name}.service"):
+                    raise RuntimeError(f"Service '{name}.service' does not exist in systemd.")
+                entry = DiscoverableService(index=0, name=name, service_state="-", timer_state="n/a")
+        if entry.name in seen:
+            continue
+        seen.add(entry.name)
+        resolved.append(entry)
+    if not resolved:
+        raise RuntimeError("Use: skuld track <id ...> or skuld track <service ...>")
+    return resolved
+
+
 def parse_unit_directives(unit_text: str) -> Dict[str, str]:
     directives: Dict[str, str] = {}
     for raw in unit_text.splitlines():
@@ -1319,7 +1418,7 @@ def _render_services_table(compact: bool, sort_by: str = "id") -> None:
     sync_registry_from_systemd()
     services = list(load_registry())
     if not services:
-        print("No services tracked by skuld.")
+        render_discoverable_services_hint()
         return
 
     rows: List[Dict[str, object]] = []
@@ -1385,6 +1484,10 @@ def list_services(args: argparse.Namespace) -> None:
 
 def list_services_compact(sort_by: str = "id") -> None:
     _render_services_table(compact=True, sort_by=sort_by)
+
+
+def catalog(_args: argparse.Namespace) -> None:
+    render_discoverable_services_hint()
 
 
 def exec_now(args: argparse.Namespace) -> None:
@@ -1590,51 +1693,56 @@ def build_recreate_command(svc: ManagedService) -> str:
 
 
 def track(args: argparse.Namespace) -> None:
-    name = normalize_service_name(args.service)
-    suggested = suggest_display_name(name)
-    alias = (args.alias or prompt_display_name(name, suggested)).strip()
-    ensure_display_name_available(alias)
     require_systemctl()
-    if get_managed(name):
-        raise RuntimeError(f"'{name}' is already tracked in skuld.")
+    targets = list(args.targets or [])
+    if not targets:
+        raise RuntimeError("Use: skuld track <id ...> or skuld track <service ...>")
+    if args.alias and len(targets) != 1:
+        raise RuntimeError("--alias can only be used when tracking exactly one service.")
 
-    service_unit = f"{name}.service"
-    timer_unit = f"{name}.timer"
-    if not unit_exists(service_unit):
-        raise RuntimeError(f"Service '{service_unit}' does not exist in systemd.")
+    resolved = resolve_discoverable_targets(targets)
+    for entry in resolved:
+        name = entry.name
+        suggested = suggest_display_name(name)
+        alias = (args.alias or prompt_display_name(name, suggested)).strip()
+        ensure_display_name_available(alias)
+        if get_managed(name):
+            raise RuntimeError(f"'{name}' is already tracked in skuld.")
 
-    service_text = systemctl_cat(service_unit)
-    directives = parse_unit_directives(service_text)
-    exec_line = directives.get("ExecStart", "")
-    if exec_line.startswith("/bin/bash -lc "):
-        exec_line = exec_line[len("/bin/bash -lc "):].strip()
-        if len(exec_line) >= 2 and exec_line[0] == exec_line[-1] and exec_line[0] in ("'", '"'):
-            exec_line = exec_line[1:-1]
-    if not exec_line:
-        exec_line = service_unit
+        service_unit = f"{name}.service"
+        timer_unit = f"{name}.timer"
+        service_text = systemctl_cat(service_unit)
+        directives = parse_unit_directives(service_text)
+        exec_line = directives.get("ExecStart", "")
+        if exec_line.startswith("/bin/bash -lc "):
+            exec_line = exec_line[len("/bin/bash -lc "):].strip()
+            if len(exec_line) >= 2 and exec_line[0] == exec_line[-1] and exec_line[0] in ("'", '"'):
+                exec_line = exec_line[1:-1]
+        if not exec_line:
+            exec_line = service_unit
 
-    show_service = systemctl_show(service_unit, ["Description", "WorkingDirectory", "User", "Restart"])
-    schedule = ""
-    timer_persistent = True
-    if unit_exists(timer_unit):
-        show_timer = systemctl_show(timer_unit, ["OnCalendar", "Persistent"])
-        schedule = show_timer.get("OnCalendar", "") or ""
-        timer_persistent = parse_bool(show_timer.get("Persistent", "true"), default=True)
+        show_service = systemctl_show(service_unit, ["Description", "WorkingDirectory", "User", "Restart"])
+        schedule = ""
+        timer_persistent = True
+        if unit_exists(timer_unit):
+            show_timer = systemctl_show(timer_unit, ["OnCalendar", "Persistent"])
+            schedule = show_timer.get("OnCalendar", "") or ""
+            timer_persistent = parse_bool(show_timer.get("Persistent", "true"), default=True)
 
-    upsert_registry(
-        ManagedService(
-            name=name,
-            exec_cmd=exec_line,
-            description=show_service.get("Description", f"Tracked service: {name}"),
-            display_name=alias,
-            schedule=schedule,
-            working_dir=show_service.get("WorkingDirectory", "") or "",
-            user=show_service.get("User", "") or "",
-            restart=show_service.get("Restart", "on-failure") or "on-failure",
-            timer_persistent=timer_persistent,
+        upsert_registry(
+            ManagedService(
+                name=name,
+                exec_cmd=exec_line,
+                description=show_service.get("Description", f"Tracked service: {name}"),
+                display_name=alias,
+                schedule=schedule,
+                working_dir=show_service.get("WorkingDirectory", "") or "",
+                user=show_service.get("User", "") or "",
+                restart=show_service.get("Restart", "on-failure") or "on-failure",
+                timer_persistent=timer_persistent,
+            )
         )
-    )
-    ok(f"Tracked '{name}' as '{alias}'.")
+        ok(f"Tracked '{name}' as '{alias}'.")
 
 
 def rename(args: argparse.Namespace) -> None:
@@ -1700,7 +1808,7 @@ def remove(args: argparse.Namespace) -> None:
 def adopt(args: argparse.Namespace) -> None:
     track(
         argparse.Namespace(
-            service=resolve_name_arg(args),
+            targets=[resolve_name_arg(args)],
             alias=getattr(args, "alias", None),
         )
     )
@@ -1943,8 +2051,11 @@ def build_parser() -> argparse.ArgumentParser:
     l.add_argument("--sort", choices=SORT_CHOICES, default="id", help="Sort by id, name, cpu, or memory")
     l.set_defaults(func=list_services)
 
-    tr = sub.add_parser("track", help="Track an existing systemd service with an optional display alias")
-    tr.add_argument("service", help="Existing service name or unit (example: nginx or nginx.service)")
+    ct = sub.add_parser("catalog", help="Show the current systemd discovery catalog")
+    ct.set_defaults(func=catalog)
+
+    tr = sub.add_parser("track", help="Track systemd services from the current catalog or by service name")
+    tr.add_argument("targets", nargs="+", help="Catalog ids or service names (example: 1 4 nginx sshd.service)")
     tr.add_argument("--alias", help="Friendly name shown by skuld")
     tr.set_defaults(func=track)
 
@@ -2085,7 +2196,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> int:
     global USE_ENV_SUDO, FORCE_TABLE_ASCII, FORCE_TABLE_UNICODE
     argv = list(sys.argv)
-    known_commands = {"create", "list", "track", "rename", "untrack", "exec", "start", "stop", "restart", "status", "logs", "stats", "remove", "adopt", "doctor", "edit", "describe", "recreate", "sync", "sudo", "version"}
+    known_commands = {"create", "list", "catalog", "track", "rename", "untrack", "exec", "start", "stop", "restart", "status", "logs", "stats", "remove", "adopt", "doctor", "edit", "describe", "recreate", "sync", "sudo", "version"}
     edit_flags = {
         "--exec",
         "--description",
@@ -2112,7 +2223,7 @@ def main() -> int:
             load_registry()
         if not getattr(args, "command", None):
             list_services_compact(resolve_sort_arg(args))
-            print("Quick help: skuld track <service ...> | skuld <id|name> exec/start/stop/restart/status/logs/stats/describe/rename/untrack")
+            print("Quick help: skuld track <id ...> | skuld <id|name> exec/start/stop/restart/status/logs/stats/describe/rename/untrack")
             print()
             return 0
 

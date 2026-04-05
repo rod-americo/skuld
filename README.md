@@ -139,6 +139,8 @@ On startup, Skuld normalizes this file automatically (canonical keys/order, pret
 ```bash
 skuld track nginx
 skuld track sshd.service --alias access-ssh
+skuld catalog
+skuld track 1 4 22
 ```
 
 On Linux, `track` inspects the existing `.service` and optional same-name `.timer`, then stores:
@@ -146,6 +148,8 @@ On Linux, `track` inspects the existing `.service` and optional same-name `.time
 - the real target name used by the backend
 - a friendly `display_name` used by Skuld
 - basic metadata used by `describe`, `stats`, and `doctor`
+
+When there are no tracked services yet, `skuld` shows a numbered catalog from `systemctl list-unit-files`. You can also reopen that catalog later with `skuld catalog`.
 
 On macOS, the first run without tracked services shows a numbered catalog from `launchctl list`. You can track from that catalog directly:
 
