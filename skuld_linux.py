@@ -2,13 +2,10 @@
 import argparse
 import json
 import os
-import pwd
 import re
-import readline
 import shlex
 import subprocess
 import sys
-import tempfile
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Dict, List, Optional, Set
@@ -24,7 +21,6 @@ DEFAULT_ENV_FILE = Path(".env")
 USE_ENV_SUDO = True
 FORCE_TABLE_ASCII = False
 FORCE_TABLE_UNICODE = False
-SCHEDULE_PROMPT_SENTINEL = "__SKULD_PROMPT_SCHEDULE__"
 SYSTEMD_UNIT_STARTED_MESSAGE_ID = "39f53479d3a045ac8e11786248231fbf"
 SORT_CHOICES = ("id", "name", "cpu", "memory")
 
@@ -459,20 +455,6 @@ def resolve_lines_arg(args: argparse.Namespace, default: int = 100) -> int:
     if lines_pos is not None:
         return lines_pos
     return default
-
-
-def prompt_schedule_edit(current: str) -> str:
-    get_hook = getattr(readline, "get_startup_hook", None)
-    previous_hook = get_hook() if callable(get_hook) else None
-    try:
-        if current:
-            readline.set_startup_hook(lambda: readline.insert_text(current))
-        value = input("Schedule (OnCalendar): ").strip()
-    finally:
-        readline.set_startup_hook(previous_hook)
-    if value:
-        return value
-    return current
 
 
 def run(cmd: List[str], check: bool = True, capture: bool = False, input_text: Optional[str] = None) -> subprocess.CompletedProcess:
@@ -1056,21 +1038,6 @@ def clip_text(text: str, width: int) -> str:
     return text[: width - 3] + "..."
 
 
-def shell_quote_pretty(value: str) -> str:
-    if value == "":
-        return '""'
-    if SHELL_SAFE_RE.match(value):
-        return value
-    escaped = (
-        value.replace("\\", "\\\\")
-        .replace('"', '\\"')
-        .replace("$", "\\$")
-        .replace("`", "\\`")
-    )
-    escaped = escaped.replace("\n", "\\n")
-    return f'"{escaped}"'
-
-
 def read_timer_schedule(name: str) -> str:
     timer_unit = f"{name}.timer"
     show = systemctl_show(timer_unit, ["OnCalendar"])
@@ -1292,125 +1259,6 @@ def parse_bool(value: str, default: bool = True) -> bool:
     if v in ("0", "false", "no", "off"):
         return False
     return default
-
-
-def write_systemd_file(target: str, content: str) -> None:
-    with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8") as tf:
-        tf.write(content)
-        tmp_path = tf.name
-    try:
-        run_sudo(["cp", tmp_path, target])
-    finally:
-        Path(tmp_path).unlink(missing_ok=True)
-
-
-def systemd_env_quote(value: str) -> str:
-    return value.replace("\\", "\\\\").replace('"', '\\"')
-
-
-def infer_home_for_user(user: str) -> str:
-    try:
-        return pwd.getpwnam(user).pw_dir
-    except KeyError:
-        return f"/home/{user}"
-
-
-def render_user_environment(user: str) -> str:
-    if not user:
-        return ""
-    home = infer_home_for_user(user)
-    home_q = systemd_env_quote(home)
-    user_q = systemd_env_quote(user)
-    path_q = systemd_env_quote(f"{home}/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
-    return (
-        f'Environment="HOME={home_q}"\n'
-        f'Environment="USER={user_q}"\n'
-        f'Environment="LOGNAME={user_q}"\n'
-        f'Environment="PATH={path_q}"\n'
-    )
-
-
-def render_service(name: str, description: str, exec_cmd: str, working_dir: str, user: str, restart: str) -> str:
-    wd_line = f"WorkingDirectory={working_dir}\n" if working_dir else ""
-    user_line = f"User={user}\n" if user else ""
-    env_lines = render_user_environment(user)
-    return (
-        "[Unit]\n"
-        f"Description={description}\n"
-        "After=network.target\n\n"
-        "[Service]\n"
-        "Type=simple\n"
-        "CPUAccounting=yes\n"
-        "MemoryAccounting=yes\n"
-        f"ExecStart=/bin/bash -lc {shlex.quote(exec_cmd)}\n"
-        f"Restart={restart}\n"
-        f"{user_line}{env_lines}{wd_line}"
-        "\n"
-        "[Install]\n"
-        "WantedBy=multi-user.target\n"
-    )
-
-
-def render_timer(name: str, schedule: str, persistent: bool) -> str:
-    p = "true" if persistent else "false"
-    return (
-        "[Unit]\n"
-        f"Description=Timer for {name}.service\n\n"
-        "[Timer]\n"
-        f"OnCalendar={schedule}\n"
-        f"Persistent={p}\n"
-        f"Unit={name}.service\n\n"
-        "[Install]\n"
-        "WantedBy=timers.target\n"
-    )
-
-
-def create(args: argparse.Namespace) -> None:
-    require_systemctl()
-    validate_name(args.name)
-
-    desc = args.description or f"Skuld service: {args.name}"
-    service_content = render_service(
-        name=args.name,
-        description=desc,
-        exec_cmd=args.exec,
-        working_dir=args.working_dir or "",
-        user=args.user or "",
-        restart=args.restart,
-    )
-    service_file = f"/etc/systemd/system/{args.name}.service"
-
-    info(f"Creating {service_file}")
-    write_systemd_file(service_file, service_content)
-
-    if args.schedule:
-        timer_content = render_timer(args.name, args.schedule, args.timer_persistent)
-        timer_file = f"/etc/systemd/system/{args.name}.timer"
-        info(f"Creating {timer_file}")
-        write_systemd_file(timer_file, timer_content)
-
-    run_sudo(["systemctl", "daemon-reload"])
-    if args.schedule:
-        # Timer jobs should be enabled via .timer only.
-        run_sudo(["systemctl", "disable", f"{args.name}.service"], check=False)
-        run_sudo(["systemctl", "enable", "--now", f"{args.name}.timer"])
-    else:
-        run_sudo(["systemctl", "enable", f"{args.name}.service"])
-
-    upsert_registry(
-        ManagedService(
-            name=args.name,
-            exec_cmd=args.exec,
-            description=desc,
-            display_name=args.name,
-            schedule=args.schedule or "",
-            working_dir=args.working_dir or "",
-            user=args.user or "",
-            restart=args.restart,
-            timer_persistent=args.timer_persistent,
-        )
-    )
-    ok(f"Service '{args.name}' created and registered.")
 
 
 def _render_services_table(compact: bool, sort_by: str = "id") -> None:
@@ -1659,39 +1507,6 @@ def stats(args: argparse.Namespace) -> None:
     print(f"restarts: {restarts}")
 
 
-def recreate(args: argparse.Namespace) -> None:
-    target = resolve_managed_arg(args)
-    name = target.name
-    sync_registry_from_systemd(name)
-    svc = require_managed(name)
-    print(build_recreate_command(svc))
-    if svc.user:
-        print()
-        print(
-            "# Note: with --user, Skuld also injects "
-            'Environment="HOME=...", "USER=...", "LOGNAME=...", and "PATH=..." in the generated unit.'
-        )
-
-
-def build_recreate_command(svc: ManagedService) -> str:
-    lines = [
-        "skuld create \\",
-        f"  --name {shell_quote_pretty(svc.name)} \\",
-        f"  --description {shell_quote_pretty(svc.description)} \\",
-    ]
-    if svc.working_dir:
-        lines.append(f"  --working-dir {shell_quote_pretty(svc.working_dir)} \\")
-    if svc.user:
-        lines.append(f"  --user {shell_quote_pretty(svc.user)} \\")
-    lines.append(f"  --restart {shell_quote_pretty(svc.restart)} \\")
-    lines.append(f"  --exec {shell_quote_pretty(svc.exec_cmd)}")
-    if svc.schedule:
-        lines[-1] = lines[-1] + " \\"
-        lines.append(f"  --schedule {shell_quote_pretty(svc.schedule)} \\")
-        lines.append("  --timer-persistent" if svc.timer_persistent else "  --no-timer-persistent")
-    return "\n".join(lines)
-
-
 def track(args: argparse.Namespace) -> None:
     require_systemctl()
     targets = list(args.targets or [])
@@ -1775,45 +1590,6 @@ def untrack(args: argparse.Namespace) -> None:
     ok(f"Removed '{svc.display_name}' from the skuld registry.")
 
 
-def remove(args: argparse.Namespace) -> None:
-    svc = resolve_managed_arg(args)
-    name = svc.name
-    require_systemctl()
-
-    service_unit = f"{name}.service"
-    timer_unit = f"{name}.timer"
-
-    # Stop first to avoid lingering runtime when removing daemon units.
-    run_sudo(["systemctl", "stop", timer_unit], check=False)
-    run_sudo(["systemctl", "stop", service_unit], check=False)
-
-    # If still active for any reason (restart policies/races), force kill.
-    if unit_active(service_unit) == "active":
-        run_sudo(["systemctl", "kill", service_unit], check=False)
-        run_sudo(["systemctl", "stop", service_unit], check=False)
-
-    run_sudo(["systemctl", "disable", timer_unit], check=False)
-    run_sudo(["systemctl", "disable", service_unit], check=False)
-    run_sudo(["rm", "-f", f"/etc/systemd/system/{name}.service"])
-    run_sudo(["rm", "-f", f"/etc/systemd/system/{name}.timer"])
-    run_sudo(["systemctl", "daemon-reload"])
-    run_sudo(["systemctl", "reset-failed", service_unit], check=False)
-    run_sudo(["systemctl", "reset-failed", timer_unit], check=False)
-
-    if args.purge:
-        remove_registry(name)
-    ok(f"Removed: {name} (purge={args.purge})")
-
-
-def adopt(args: argparse.Namespace) -> None:
-    track(
-        argparse.Namespace(
-            targets=[resolve_name_arg(args)],
-            alias=getattr(args, "alias", None),
-        )
-    )
-
-
 def doctor(_args: argparse.Namespace) -> None:
     require_systemctl()
     sync_registry_from_systemd()
@@ -1861,115 +1637,6 @@ def doctor(_args: argparse.Namespace) -> None:
         ok("doctor: no issues found.")
     else:
         err(f"doctor: found {issues} issue(s).")
-
-
-def apply_managed_update(
-    current: ManagedService,
-    *,
-    exec_cmd: Optional[str] = None,
-    description: Optional[str] = None,
-    working_dir: Optional[str] = None,
-    user: Optional[str] = None,
-    restart: Optional[str] = None,
-    schedule: Optional[str] = None,
-    timer_persistent: Optional[bool] = None,
-    clear_schedule: bool = False,
-) -> bool:
-    name = current.name
-    service_unit = f"{name}.service"
-    timer_unit = f"{name}.timer"
-    timer_path = f"/etc/systemd/system/{name}.timer"
-    new_exec = exec_cmd if exec_cmd is not None else current.exec_cmd
-    new_description = description if description is not None else current.description
-    new_workdir = working_dir if working_dir is not None else current.working_dir
-    new_user = user if user is not None else current.user
-    new_restart = restart if restart is not None else current.restart
-    new_schedule = schedule if schedule is not None else current.schedule
-    if clear_schedule:
-        new_schedule = ""
-    new_timer_persistent = current.timer_persistent if timer_persistent is None else timer_persistent
-
-    if (
-        new_exec == current.exec_cmd
-        and new_description == current.description
-        and new_workdir == current.working_dir
-        and new_user == current.user
-        and new_restart == current.restart
-        and new_schedule == current.schedule
-        and new_timer_persistent == current.timer_persistent
-    ):
-        return False
-
-    service_content = render_service(
-        name=name,
-        description=new_description,
-        exec_cmd=new_exec,
-        working_dir=new_workdir,
-        user=new_user,
-        restart=new_restart,
-    )
-    write_systemd_file(f"/etc/systemd/system/{name}.service", service_content)
-
-    timer_exists_before = timer_unit_exists(name)
-    if (not new_schedule) and timer_exists_before:
-        run_sudo(["systemctl", "stop", timer_unit], check=False, capture=True)
-        run_sudo(["systemctl", "disable", timer_unit], check=False, capture=True)
-
-    if new_schedule:
-        timer_content = render_timer(name, new_schedule, new_timer_persistent)
-        write_systemd_file(timer_path, timer_content)
-    else:
-        run_sudo(["rm", "-f", timer_path], check=False)
-
-    run_sudo(["systemctl", "daemon-reload"])
-    if new_schedule:
-        # Timer jobs should be enabled via .timer only.
-        run_sudo(["systemctl", "disable", service_unit], check=False)
-        run_sudo(["systemctl", "enable", timer_unit], check=False)
-    else:
-        run_sudo(["systemctl", "enable", service_unit], check=False)
-
-    upsert_registry(
-        ManagedService(
-            name=name,
-            exec_cmd=new_exec,
-            description=new_description,
-            display_name=current.display_name,
-            schedule=new_schedule,
-            working_dir=new_workdir,
-            user=new_user,
-            restart=new_restart,
-            timer_persistent=new_timer_persistent,
-            id=current.id,
-        )
-    )
-    return True
-
-
-def edit(args: argparse.Namespace) -> None:
-    svc = resolve_managed_arg(args)
-    name = svc.name
-    require_systemctl()
-    current = require_managed(name)
-    schedule = args.schedule
-    if schedule == SCHEDULE_PROMPT_SENTINEL and not args.clear_schedule:
-        schedule = prompt_schedule_edit(current.schedule)
-
-    changed = apply_managed_update(
-        current,
-        exec_cmd=args.exec,
-        description=args.description,
-        working_dir=args.working_dir,
-        user=args.user,
-        restart=args.restart,
-        schedule=schedule,
-        timer_persistent=args.timer_persistent,
-        clear_schedule=args.clear_schedule,
-    )
-    if not changed:
-        info("No changes detected.")
-        return
-    ok(f"Service '{current.display_name}' updated.")
 
 
 def describe(args: argparse.Namespace) -> None:
@@ -2035,17 +1702,6 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--unicode", action="store_true", help="Force Unicode table borders")
     p.add_argument("--sort", choices=SORT_CHOICES, default="id", help="Sort service views by id, name, cpu, or memory")
     sub = p.add_subparsers(dest="command", required=False)
-
-    c = sub.add_parser("create", help="Legacy: create and install .service and optional .timer")
-    c.add_argument("--name", required=True)
-    c.add_argument("--exec", required=True, help="ExecStart command")
-    c.add_argument("--description")
-    c.add_argument("--working-dir")
-    c.add_argument("--user")
-    c.add_argument("--restart", default="on-failure")
-    c.add_argument("--schedule", help="Timer OnCalendar expression")
-    c.add_argument("--timer-persistent", action=argparse.BooleanOptionalAction, default=True)
-    c.set_defaults(func=create)
 
     l = sub.add_parser("list", help="List services tracked by skuld")
     l.add_argument("--sort", choices=SORT_CHOICES, default="id", help="Sort by id, name, cpu, or memory")
@@ -2124,52 +1780,14 @@ def build_parser() -> argparse.ArgumentParser:
     stt.add_argument("--boot", action="store_true", help="Count entries from current boot only")
     stt.set_defaults(func=stats)
 
-    rm = sub.add_parser("remove", help="Legacy: remove units from systemd")
-    rm.add_argument("name", nargs="?")
-    rm.add_argument("--name", dest="name_flag")
-    rm.add_argument("--id", dest="id_flag", type=int)
-    rm.add_argument("--purge", action="store_true")
-    rm.set_defaults(func=remove)
-
-    ad = sub.add_parser("adopt", help="Legacy alias for track")
-    ad.add_argument("name", nargs="?")
-    ad.add_argument("--name", dest="name_flag")
-    ad.add_argument("--alias")
-    ad.set_defaults(func=adopt)
-
     dr = sub.add_parser("doctor", help="Check registry/systemd inconsistencies")
     dr.set_defaults(func=doctor)
-
-    ed = sub.add_parser("edit", help="Legacy: edit a managed service definition")
-    ed.add_argument("name", nargs="?")
-    ed.add_argument("--name", dest="name_flag")
-    ed.add_argument("--id", dest="id_flag", type=int)
-    ed.add_argument("--exec")
-    ed.add_argument("--description")
-    ed.add_argument("--working-dir")
-    ed.add_argument("--user")
-    ed.add_argument("--restart")
-    ed.add_argument(
-        "--schedule",
-        nargs="?",
-        const=SCHEDULE_PROMPT_SENTINEL,
-        help="Timer OnCalendar expression. If omitted, opens interactive edit with current value.",
-    )
-    ed.add_argument("--clear-schedule", action="store_true")
-    ed.add_argument("--timer-persistent", action=argparse.BooleanOptionalAction, default=None)
-    ed.set_defaults(func=edit)
 
     ds = sub.add_parser("describe", help="Show details for a tracked service")
     ds.add_argument("name", nargs="?")
     ds.add_argument("--name", dest="name_flag")
     ds.add_argument("--id", dest="id_flag", type=int)
     ds.set_defaults(func=describe)
-
-    rc = sub.add_parser("recreate", help="Legacy: print equivalent skuld create command for a managed service")
-    rc.add_argument("name", nargs="?")
-    rc.add_argument("--name", dest="name_flag")
-    rc.add_argument("--id", dest="id_flag", type=int)
-    rc.set_defaults(func=recreate)
 
     sy = sub.add_parser("sync", help="Backfill missing registry fields from systemd")
     sy.add_argument("name", nargs="?", help="Sync only one managed service")
@@ -2196,21 +1814,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> int:
     global USE_ENV_SUDO, FORCE_TABLE_ASCII, FORCE_TABLE_UNICODE
     argv = list(sys.argv)
-    known_commands = {"create", "list", "catalog", "track", "rename", "untrack", "exec", "start", "stop", "restart", "status", "logs", "stats", "remove", "adopt", "doctor", "edit", "describe", "recreate", "sync", "sudo", "version"}
-    edit_flags = {
-        "--exec",
-        "--description",
-        "--working-dir",
-        "--user",
-        "--restart",
-        "--schedule",
-        "--clear-schedule",
-        "--timer-persistent",
-        "--no-timer-persistent",
-    }
-    if len(argv) > 2 and not argv[1].startswith("-") and argv[1] not in known_commands:
-        if any(flag in argv[2:] for flag in edit_flags):
-            argv = [argv[0], "edit", argv[1], *argv[2:]]
+    known_commands = {"list", "catalog", "track", "rename", "untrack", "exec", "start", "stop", "restart", "status", "logs", "stats", "doctor", "describe", "sync", "sudo", "version"}
     parser = build_parser()
     args = parser.parse_args(argv[1:])
     USE_ENV_SUDO = not args.no_env_sudo
@@ -2228,7 +1832,7 @@ def main() -> int:
             return 0
 
         args.func(args)
-        if args.command in {"create", "track", "rename", "untrack", "exec", "start", "stop", "restart", "remove", "adopt", "edit", "sync"}:
+        if args.command in {"track", "rename", "untrack", "exec", "start", "stop", "restart", "sync"}:
             print()
             list_services_compact(resolve_sort_arg(args))
         return 0

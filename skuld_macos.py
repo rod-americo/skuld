@@ -5,10 +5,8 @@ import json
 import os
 import plistlib
 import pwd
-import readline
 import re
 import shlex
-import shutil
 import signal
 import subprocess
 import sys
@@ -23,7 +21,6 @@ VERSION = "0.3.0"
 NAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._@-]*$")
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 SHELL_SAFE_RE = re.compile(r"^[A-Za-z0-9_@%+=:,./-]+$")
-SCHEDULE_PROMPT_SENTINEL = "__SKULD_PROMPT_SCHEDULE__"
 DEFAULT_ENV_FILE = Path(".env")
 SKULD_HOME = Path(os.environ.get("SKULD_HOME", Path.home() / "Library/Application Support/skuld"))
 REGISTRY_FILE = SKULD_HOME / "services.json"
@@ -427,18 +424,6 @@ def render_table(headers: List[str], rows: List[List[str]]) -> None:
     for row in rows:
         print(format_row(row))
     print(hline(box["bottom_left"], box["bottom_mid"], box["bottom_right"]))
-
-
-def prompt_schedule_edit(current: str) -> str:
-    get_hook = getattr(readline, "get_startup_hook", None)
-    previous_hook = get_hook() if callable(get_hook) else None
-    try:
-        if current:
-            readline.set_startup_hook(lambda: readline.insert_text(current))
-        value = input("Schedule: ").strip()
-    finally:
-        readline.set_startup_hook(previous_hook)
-    return value if value else current
 
 
 def current_user_name() -> str:
@@ -1312,43 +1297,6 @@ def track(args: argparse.Namespace) -> None:
         upsert_registry(service)
         ok(f"Tracked '{label}' as '{alias}'.")
 
-
-def create(args: argparse.Namespace) -> None:
-    validate_name(args.name)
-    scope = resolve_scope(args.scope)
-    require_supported_scope_user(scope, args.user or "")
-    desc = args.description or f"Skuld service: {args.name}"
-    launchd_label = service_label(args.name)
-    plist_path = (
-        current_user_home() / "Library/LaunchAgents" / f"{launchd_label}.plist"
-        if scope == "agent"
-        else Path("/Library/LaunchDaemons") / f"{launchd_label}.plist"
-    )
-    service = ManagedService(
-        name=args.name,
-        exec_cmd=args.exec,
-        description=desc,
-        display_name=args.name,
-        launchd_label=launchd_label,
-        plist_path_hint=str(plist_path),
-        managed_by_skuld=True,
-        schedule=args.schedule or "",
-        working_dir=args.working_dir or "",
-        user=args.user or "",
-        restart=args.restart,
-        timer_persistent=args.timer_persistent,
-        scope=scope,
-        log_dir=str(log_dir_for_service(args.name, scope)),
-    )
-    if get_managed(service.name):
-        raise RuntimeError(f"'{service.name}' is already registered in skuld.")
-    install_service_files(service)
-    bootstrap_service(service)
-    upsert_registry(service)
-    update_runtime_stats(service)
-    ok(f"Service '{service.display_name}' created and registered.")
-
-
 def managed_uses_schedule(service: ManagedService) -> bool:
     return bool(service.schedule)
 
@@ -1666,58 +1614,6 @@ def stats(args: argparse.Namespace) -> None:
     print(f"last_run: {item.get('last_run', '-')}")
     print(f"last_exit_status: {item.get('last_exit_status', '-')}")
 
-
-def build_recreate_command(service: ManagedService) -> str:
-    lines = [
-        "skuld create \\",
-        f"  --name {shell_quote_pretty(service.name)} \\",
-        f"  --description {shell_quote_pretty(service.description)} \\",
-        f"  --scope {service.scope} \\",
-    ]
-    if service.working_dir:
-        lines.append(f"  --working-dir {shell_quote_pretty(service.working_dir)} \\")
-    if service.user:
-        lines.append(f"  --user {shell_quote_pretty(service.user)} \\")
-    lines.append(f"  --restart {shell_quote_pretty(service.restart)} \\")
-    lines.append(f"  --exec {shell_quote_pretty(service.exec_cmd)}")
-    if service.schedule:
-        lines[-1] = lines[-1] + " \\"
-        lines.append(f"  --schedule {shell_quote_pretty(service.schedule)} \\")
-        lines.append("  --timer-persistent" if service.timer_persistent else "  --no-timer-persistent")
-    return "\n".join(lines)
-
-
-def recreate(args: argparse.Namespace) -> None:
-    service = resolve_managed_arg(args)
-    if not service:
-        raise RuntimeError("Service target is required.")
-    if not service.managed_by_skuld:
-        raise RuntimeError("recreate is only available for jobs created by skuld on macOS.")
-    print(build_recreate_command(service))
-
-
-def remove(args: argparse.Namespace) -> None:
-    service = resolve_managed_arg(args)
-    if not service:
-        raise RuntimeError("Service target is required.")
-    if not service.managed_by_skuld:
-        raise RuntimeError("remove is only available for jobs created by skuld on macOS. Use untrack instead.")
-    bootout_service(service)
-    rm_file(plist_path_for_service(service), service.scope)
-    rm_file(wrapper_script_for_service(service.name, service.scope), service.scope)
-    if args.purge:
-        log_dir = Path(service.log_dir)
-        if service.scope == "daemon":
-            run_sudo(["rm", "-rf", str(log_dir)], check=False)
-            run_sudo(["rm", "-f", str(event_file_for_service(service.name, service.scope))], check=False)
-        else:
-            if log_dir.exists():
-                shutil.rmtree(log_dir, ignore_errors=True)
-            event_file_for_service(service.name, service.scope).unlink(missing_ok=True)
-        remove_registry(service.name)
-    ok(f"Removed: {service.name} (purge={args.purge})")
-
-
 def doctor(_args: argparse.Namespace) -> None:
     services = load_registry()
     if not services:
@@ -1744,88 +1640,6 @@ def doctor(_args: argparse.Namespace) -> None:
         ok("doctor: no issues found.")
     else:
         err(f"doctor: found {issues} issue(s).")
-
-
-def apply_managed_update(
-    current: ManagedService,
-    *,
-    exec_cmd: Optional[str] = None,
-    description: Optional[str] = None,
-    working_dir: Optional[str] = None,
-    user: Optional[str] = None,
-    restart: Optional[str] = None,
-    schedule: Optional[str] = None,
-    timer_persistent: Optional[bool] = None,
-    clear_schedule: bool = False,
-    scope: Optional[str] = None,
-) -> bool:
-    if not current.managed_by_skuld:
-        raise RuntimeError("edit is only available for jobs created by skuld on macOS.")
-    new_scope = resolve_scope(scope or current.scope)
-    new_exec = exec_cmd if exec_cmd is not None else current.exec_cmd
-    new_description = description if description is not None else current.description
-    new_workdir = working_dir if working_dir is not None else current.working_dir
-    new_user = user if user is not None else current.user
-    new_restart = restart if restart is not None else current.restart
-    new_schedule = schedule if schedule is not None else current.schedule
-    if clear_schedule:
-        new_schedule = ""
-    new_timer_persistent = current.timer_persistent if timer_persistent is None else timer_persistent
-    require_supported_scope_user(new_scope, new_user)
-    updated = ManagedService(
-        name=current.name,
-        exec_cmd=new_exec,
-        description=new_description,
-        display_name=current.display_name,
-        launchd_label=current.launchd_label,
-        plist_path_hint=current.plist_path_hint,
-        managed_by_skuld=current.managed_by_skuld,
-        schedule=new_schedule,
-        working_dir=new_workdir,
-        user=new_user,
-        restart=new_restart,
-        timer_persistent=new_timer_persistent,
-        id=current.id,
-        backend="launchd",
-        scope=new_scope,
-        log_dir=str(log_dir_for_service(current.name, new_scope)),
-    )
-    if asdict(updated) == asdict(current):
-        return False
-    bootout_service(current)
-    if current.scope != updated.scope:
-        rm_file(plist_path_for_service(current), current.scope)
-        rm_file(wrapper_script_for_service(current.name, current.scope), current.scope)
-    install_service_files(updated)
-    bootstrap_service(updated)
-    upsert_registry(updated)
-    return True
-
-
-def edit(args: argparse.Namespace) -> None:
-    service = resolve_managed_arg(args)
-    if not service:
-        raise RuntimeError("Service target is required.")
-    schedule = args.schedule
-    if schedule == SCHEDULE_PROMPT_SENTINEL and not args.clear_schedule:
-        schedule = prompt_schedule_edit(service.schedule)
-    changed = apply_managed_update(
-        service,
-        exec_cmd=args.exec,
-        description=args.description,
-        working_dir=args.working_dir,
-        user=args.user,
-        restart=args.restart,
-        schedule=schedule,
-        timer_persistent=args.timer_persistent,
-        clear_schedule=args.clear_schedule,
-        scope=args.scope,
-    )
-    if not changed:
-        info("No changes detected.")
-        return
-    ok(f"Service '{service.display_name}' updated.")
-
 
 def rename(args: argparse.Namespace) -> None:
     service = resolve_managed_arg(args)
@@ -1902,11 +1716,6 @@ def sync(args: argparse.Namespace) -> None:
     else:
         ok(f"Registry updated for {changed} service(s).")
 
-
-def adopt(_args: argparse.Namespace) -> None:
-    raise RuntimeError("adopt is not supported on macOS.")
-
-
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="skuld", description="CLI for tracking and operating launchd jobs")
     parser.add_argument(
@@ -1918,18 +1727,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--unicode", action="store_true", help="Force Unicode table borders")
     parser.add_argument("--sort", choices=SORT_CHOICES, default="id", help="Sort service views by id, name, cpu, or memory")
     sub = parser.add_subparsers(dest="command", required=False)
-
-    create_parser = sub.add_parser("create", help="Legacy: create and install a launchd job")
-    create_parser.add_argument("--name", required=True)
-    create_parser.add_argument("--exec", required=True, help="Program command")
-    create_parser.add_argument("--description")
-    create_parser.add_argument("--working-dir")
-    create_parser.add_argument("--user")
-    create_parser.add_argument("--restart", default="on-failure")
-    create_parser.add_argument("--schedule", help="Supported subset of systemd-like schedule expressions")
-    create_parser.add_argument("--timer-persistent", action=argparse.BooleanOptionalAction, default=True)
-    create_parser.add_argument("--scope", choices=["daemon", "agent"], default="agent")
-    create_parser.set_defaults(func=create)
 
     list_parser = sub.add_parser("list", help="List services tracked by skuld")
     list_parser.add_argument("--sort", choices=SORT_CHOICES, default="id", help="Sort by id, name, cpu, or memory")
@@ -2008,52 +1805,14 @@ def build_parser() -> argparse.ArgumentParser:
     stats_parser.add_argument("--boot", action="store_true", help="Ignored on macOS event stats")
     stats_parser.set_defaults(func=stats)
 
-    remove_parser = sub.add_parser("remove", help="Legacy: remove jobs")
-    remove_parser.add_argument("name", nargs="?")
-    remove_parser.add_argument("--name", dest="name_flag")
-    remove_parser.add_argument("--id", dest="id_flag", type=int)
-    remove_parser.add_argument("--purge", action="store_true")
-    remove_parser.set_defaults(func=remove)
-
-    adopt_parser = sub.add_parser("adopt", help="Not supported on macOS")
-    adopt_parser.add_argument("name", nargs="?")
-    adopt_parser.add_argument("--name", dest="name_flag")
-    adopt_parser.set_defaults(func=adopt)
-
     doctor_parser = sub.add_parser("doctor", help="Check registry/launchd inconsistencies")
     doctor_parser.set_defaults(func=doctor)
-
-    edit_parser = sub.add_parser("edit", help="Legacy: edit a managed service definition")
-    edit_parser.add_argument("name", nargs="?")
-    edit_parser.add_argument("--name", dest="name_flag")
-    edit_parser.add_argument("--id", dest="id_flag", type=int)
-    edit_parser.add_argument("--exec")
-    edit_parser.add_argument("--description")
-    edit_parser.add_argument("--working-dir")
-    edit_parser.add_argument("--user")
-    edit_parser.add_argument("--restart")
-    edit_parser.add_argument(
-        "--schedule",
-        nargs="?",
-        const=SCHEDULE_PROMPT_SENTINEL,
-        help="Supported subset of systemd-like schedule expressions. If omitted, opens interactive edit.",
-    )
-    edit_parser.add_argument("--clear-schedule", action="store_true")
-    edit_parser.add_argument("--timer-persistent", action=argparse.BooleanOptionalAction, default=None)
-    edit_parser.add_argument("--scope", choices=["daemon", "agent"])
-    edit_parser.set_defaults(func=edit)
 
     describe_parser = sub.add_parser("describe", help="Show details for a tracked service")
     describe_parser.add_argument("name", nargs="?")
     describe_parser.add_argument("--name", dest="name_flag")
     describe_parser.add_argument("--id", dest="id_flag", type=int)
     describe_parser.set_defaults(func=describe)
-
-    recreate_parser = sub.add_parser("recreate", help="Legacy: print equivalent skuld create command for a managed service")
-    recreate_parser.add_argument("name", nargs="?")
-    recreate_parser.add_argument("--name", dest="name_flag")
-    recreate_parser.add_argument("--id", dest="id_flag", type=int)
-    recreate_parser.set_defaults(func=recreate)
 
     sync_parser = sub.add_parser("sync", help="Backfill missing registry fields from launchd")
     sync_parser.add_argument("name", nargs="?", help="Sync only one managed service")
@@ -2080,22 +1839,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> int:
     global USE_ENV_SUDO, FORCE_TABLE_ASCII, FORCE_TABLE_UNICODE
     argv = list(sys.argv)
-    known_commands = {"create", "list", "catalog", "track", "rename", "untrack", "exec", "start", "stop", "restart", "status", "logs", "stats", "remove", "adopt", "doctor", "edit", "describe", "recreate", "sync", "sudo", "version"}
-    edit_flags = {
-        "--exec",
-        "--description",
-        "--working-dir",
-        "--user",
-        "--restart",
-        "--schedule",
-        "--clear-schedule",
-        "--timer-persistent",
-        "--no-timer-persistent",
-        "--scope",
-    }
-    if len(argv) > 2 and not argv[1].startswith("-") and argv[1] not in known_commands:
-        if any(flag in argv[2:] for flag in edit_flags):
-            argv = [argv[0], "edit", argv[1], *argv[2:]]
+    known_commands = {"list", "catalog", "track", "rename", "untrack", "exec", "start", "stop", "restart", "status", "logs", "stats", "doctor", "describe", "sync", "sudo", "version"}
     parser = build_parser()
     args = parser.parse_args(argv[1:])
     USE_ENV_SUDO = not args.no_env_sudo
@@ -2112,7 +1856,7 @@ def main() -> int:
             print()
             return 0
         args.func(args)
-        if args.command in {"create", "track", "rename", "untrack", "exec", "start", "stop", "restart", "remove", "edit", "sync"}:
+        if args.command in {"track", "rename", "untrack", "exec", "start", "stop", "restart", "sync"}:
             print()
             list_services_compact(resolve_sort_arg(args))
         return 0
