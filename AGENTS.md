@@ -35,6 +35,12 @@ This file defines collaboration and coding behavior for contributors and AI agen
 - Warn users when using `.env` sudo password support.
 - Never log secrets.
 
+## Git Workflow
+
+- For this repository, commit directly on `main`.
+- Do not create `codex/*` branches unless the user explicitly asks for a separate branch workflow.
+- When the user asks to commit and push, default to `git push origin main`.
+
 ## Testing Expectations
 
 - Run syntax checks before finalizing changes:
