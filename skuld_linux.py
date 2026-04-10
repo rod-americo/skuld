@@ -526,12 +526,20 @@ def resolve_lines_arg(args: argparse.Namespace, default: int = 100) -> int:
     return default
 
 
-def run(cmd: List[str], check: bool = True, capture: bool = False, input_text: Optional[str] = None) -> subprocess.CompletedProcess:
+def run(
+    cmd: List[str],
+    check: bool = True,
+    capture: bool = False,
+    input_text: Optional[str] = None,
+    env: Optional[Dict[str, str]] = None,
+) -> subprocess.CompletedProcess:
     kwargs = {"text": True}
     if capture:
         kwargs["capture_output"] = True
     if input_text is not None:
         kwargs["input"] = input_text
+    if env is not None:
+        kwargs["env"] = env
     proc = subprocess.run(cmd, **kwargs)
     if check and proc.returncode != 0:
         raise RuntimeError(f"Command failed: {' '.join(shlex.quote(c) for c in cmd)}")
@@ -593,6 +601,27 @@ def require_systemctl() -> None:
         raise RuntimeError("systemctl not found. This tool requires Linux with systemd.") from exc
 
 
+def systemd_scope_env(scope: str) -> Optional[Dict[str, str]]:
+    if normalize_scope(scope) != "user":
+        return None
+
+    env = dict(os.environ)
+    uid = os.getuid()
+    runtime_dir = (env.get("XDG_RUNTIME_DIR") or "").strip()
+    if not runtime_dir:
+        fallback = Path(f"/run/user/{uid}")
+        if fallback.exists():
+            runtime_dir = str(fallback)
+            env["XDG_RUNTIME_DIR"] = runtime_dir
+
+    if runtime_dir:
+        bus_path = Path(runtime_dir) / "bus"
+        if bus_path.exists() and not (env.get("DBUS_SESSION_BUS_ADDRESS") or "").strip():
+            env["DBUS_SESSION_BUS_ADDRESS"] = f"unix:path={bus_path}"
+
+    return env
+
+
 def systemctl_command(scope: str, args: List[str]) -> List[str]:
     cmd = ["systemctl"]
     if normalize_scope(scope) == "user":
@@ -611,7 +640,7 @@ def run_systemctl_action(scope: str, args: List[str], check: bool = True, captur
     cmd = systemctl_command(scope, args)
     if normalize_scope(scope) == "system":
         return run_sudo(cmd, check=check, capture=capture)
-    return run(cmd, check=check, capture=capture)
+    return run(cmd, check=check, capture=capture, env=systemd_scope_env(scope))
 
 
 def unit_exists(unit: str, scope: str = "system") -> bool:
@@ -621,7 +650,7 @@ def unit_exists(unit: str, scope: str = "system") -> bool:
 
 
 def unit_active(unit: str, scope: str = "system") -> str:
-    proc = run(systemctl_command(scope, ["is-active", unit]), check=False, capture=True)
+    proc = run(systemctl_command(scope, ["is-active", unit]), check=False, capture=True, env=systemd_scope_env(scope))
     status = (proc.stdout or "").strip()
     return status if status else "inactive"
 
@@ -1233,7 +1262,7 @@ def systemctl_show(unit: str, props: List[str], scope: str = "system") -> Dict[s
     cmd = systemctl_command(scope, ["show", unit, "--no-pager"])
     for p in props:
         cmd.extend(["-p", p])
-    proc = run(cmd, check=False, capture=True)
+    proc = run(cmd, check=False, capture=True, env=systemd_scope_env(scope))
     result: Dict[str, str] = {}
     for line in (proc.stdout or "").splitlines():
         if "=" not in line:
@@ -1244,7 +1273,12 @@ def systemctl_show(unit: str, props: List[str], scope: str = "system") -> Dict[s
 
 
 def systemctl_cat(unit: str, scope: str = "system") -> str:
-    proc = run(systemctl_command(scope, ["cat", unit, "--no-pager"]), check=False, capture=True)
+    proc = run(
+        systemctl_command(scope, ["cat", unit, "--no-pager"]),
+        check=False,
+        capture=True,
+        env=systemd_scope_env(scope),
+    )
     if proc.returncode != 0:
         return ""
     return proc.stdout or ""
@@ -1255,6 +1289,7 @@ def list_discoverable_services_for_scope(scope: str) -> List[DiscoverableService
         systemctl_command(scope, ["list-unit-files", "--type=service", "--type=timer", "--no-legend", "--no-pager"]),
         check=False,
         capture=True,
+        env=systemd_scope_env(scope),
     )
     if proc.returncode != 0:
         return []
@@ -1557,8 +1592,9 @@ def status(args: argparse.Namespace) -> None:
     name = svc.name
     require_systemctl()
     print(f"[skuld] {svc.display_name} -> {format_scoped_name(name, svc.scope)}")
-    run(systemctl_command(svc.scope, ["status", f"{name}.service", "--no-pager"]), check=False)
-    run(systemctl_command(svc.scope, ["status", f"{name}.timer", "--no-pager"]), check=False)
+    scope_env = systemd_scope_env(svc.scope)
+    run(systemctl_command(svc.scope, ["status", f"{name}.service", "--no-pager"]), check=False, env=scope_env)
+    run(systemctl_command(svc.scope, ["status", f"{name}.timer", "--no-pager"]), check=False, env=scope_env)
 
 
 def logs(args: argparse.Namespace) -> None:
@@ -1567,6 +1603,7 @@ def logs(args: argparse.Namespace) -> None:
     lines = resolve_lines_arg(args, default=100)
     require_systemctl()
     unit = f"{name}.timer" if args.timer else f"{name}.service"
+    scope_env = systemd_scope_env(svc.scope)
     cmd = journalctl_command(svc.scope, ["-u", unit, "-n", str(lines)])
     output_mode = "cat" if args.plain else args.output
     cmd.extend(["-o", output_mode])
@@ -1576,7 +1613,7 @@ def logs(args: argparse.Namespace) -> None:
         cmd.append("-f")
         # For streaming mode, avoid capture so output is shown in real time.
         probe_cmd = [c for c in cmd if c != "-f"] + ["-n", "1", "--no-pager"]
-        probe = run(probe_cmd, check=False, capture=True)
+        probe = run(probe_cmd, check=False, capture=True, env=scope_env)
         probe_err = (probe.stderr or "").lower()
         needs_sudo = svc.scope == "system" and (
             "not seeing messages from other users and the system" in probe_err
@@ -1585,11 +1622,11 @@ def logs(args: argparse.Namespace) -> None:
         if needs_sudo:
             run_sudo(cmd, check=False)
         else:
-            run(cmd, check=False)
+            run(cmd, check=False, env=scope_env)
         return
     else:
         cmd.append("--no-pager")
-    proc = run(cmd, check=False, capture=True)
+    proc = run(cmd, check=False, capture=True, env=scope_env)
     stderr = (proc.stderr or "").strip()
     stdout = (proc.stdout or "").strip()
 
@@ -1606,6 +1643,7 @@ def logs(args: argparse.Namespace) -> None:
 
 
 def count_unit_starts(unit: str, scope: str = "system", since: Optional[str] = None, boot: bool = False) -> int:
+    scope_env = systemd_scope_env(scope)
     cmd = journalctl_command(
         scope,
         [
@@ -1622,7 +1660,7 @@ def count_unit_starts(unit: str, scope: str = "system", since: Optional[str] = N
     if boot:
         cmd.append("-b")
 
-    proc = run(cmd, check=False, capture=True)
+    proc = run(cmd, check=False, capture=True, env=scope_env)
     stderr = (proc.stderr or "").strip()
     stdout = proc.stdout or ""
     if normalize_scope(scope) == "system" and journal_permission_hint(stderr):
