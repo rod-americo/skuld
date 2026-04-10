@@ -169,6 +169,7 @@ skuld sudo run -- <command>
 ```bash
 skuld track nginx
 skuld track sshd.service --alias access-ssh
+skuld track user:syncthing --alias sync-home
 skuld catalog
 skuld track 1 4 22
 ```
@@ -176,10 +177,13 @@ skuld track 1 4 22
 On Linux, `track` inspects the existing `.service` and optional same-name `.timer`, then stores:
 
 - the real target name used by the backend
+- the systemd scope used by the backend (`system` or `user`)
 - a friendly `display_name` used by Skuld
 - basic metadata used by `describe`, `stats`, and `doctor`
 
-When there are no tracked services yet, `skuld` shows a numbered catalog from `systemctl list-unit-files`. You can also reopen that catalog later with `skuld catalog`.
+When there are no tracked services yet, `skuld` shows a numbered catalog from both `systemctl list-unit-files` and `systemctl --user list-unit-files`. You can also reopen that catalog later with `skuld catalog`.
+
+If the same service name exists in both scopes, use an explicit target such as `system:nginx` or `user:nginx`.
 
 On macOS, the first run without tracked services shows a numbered catalog from `launchctl list`. You can track from that catalog directly:
 
