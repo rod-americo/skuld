@@ -57,6 +57,38 @@ SYSTEMD_DURATION_LABELS = {
     "year": ("year", "years"),
     "years": ("year", "years"),
 }
+SYSTEMD_DURATION_SHORT = {
+    "us": "us",
+    "usec": "us",
+    "ms": "ms",
+    "msec": "ms",
+    "s": "s",
+    "sec": "s",
+    "secs": "s",
+    "second": "s",
+    "seconds": "s",
+    "m": "m",
+    "min": "m",
+    "mins": "m",
+    "minute": "m",
+    "minutes": "m",
+    "h": "h",
+    "hr": "h",
+    "hrs": "h",
+    "hour": "h",
+    "hours": "h",
+    "d": "d",
+    "day": "d",
+    "days": "d",
+    "w": "w",
+    "week": "w",
+    "weeks": "w",
+    "month": "mo",
+    "months": "mo",
+    "y": "y",
+    "year": "y",
+    "years": "y",
+}
 
 
 @dataclass
@@ -1234,6 +1266,34 @@ def humanize_systemd_duration(value: str) -> str:
     return " ".join(parts) if parts else raw
 
 
+def compact_systemd_duration(value: str) -> str:
+    raw = re.sub(r"\s+", "", (value or "").strip().lower())
+    if not raw:
+        return "-"
+
+    parts: List[str] = []
+    cursor = 0
+    for match in re.finditer(r"(\d+(?:\.\d+)?)([a-z]+)", raw):
+        if match.start() != cursor:
+            return humanize_systemd_duration(value)
+        amount_text, unit = match.groups()
+        suffix = SYSTEMD_DURATION_SHORT.get(unit)
+        if not suffix:
+            return humanize_systemd_duration(value)
+        try:
+            amount = float(amount_text)
+        except ValueError:
+            return humanize_systemd_duration(value)
+        if amount.is_integer():
+            amount_text = str(int(amount))
+        parts.append(f"{amount_text}{suffix}")
+        cursor = match.end()
+
+    if cursor != len(raw) or not parts:
+        return humanize_systemd_duration(value)
+    return "".join(parts)
+
+
 def humanize_calendar_prefix(value: str) -> Optional[str]:
     raw = re.sub(r"\s+", " ", (value or "").strip())
     if not raw or raw == "*-*-*":
@@ -1259,11 +1319,34 @@ def with_calendar_prefix(prefix: str, phrase: str) -> str:
     return f"{cleaned_prefix} {phrase}"
 
 
+def evenly_spaced(values: List[int], cycle: int) -> Optional[int]:
+    if len(values) < 2:
+        return None
+    ordered = sorted(dict.fromkeys(values))
+    if len(ordered) < 2:
+        return None
+    steps = [(ordered[(idx + 1) % len(ordered)] - ordered[idx]) % cycle for idx in range(len(ordered))]
+    first = steps[0]
+    if first <= 0:
+        return None
+    if all(step == first for step in steps):
+        return first
+    return None
+
+
+def format_short_list(items: List[str], max_items: int = 3) -> str:
+    if len(items) <= max_items:
+        return ", ".join(items)
+    visible = ", ".join(items[:max_items])
+    return f"{visible}, +{len(items) - max_items}"
+
+
 def humanize_timer_calendar(value: str) -> str:
     raw = re.sub(r"\s+", " ", (value or "").strip())
     if not raw:
         return "-"
-    parts = raw.split(" ")
+    normalized = re.sub(r",\s+", ",", raw)
+    parts = normalized.split(" ")
     if len(parts) < 2:
         cleaned = raw.replace("..", "-")
         cleaned = re.sub(r",\s*", ", ", cleaned)
@@ -1276,21 +1359,40 @@ def humanize_timer_calendar(value: str) -> str:
         if time_expr == "*:*:00":
             return with_calendar_prefix(prefix, "every minute")
 
+        match = re.fullmatch(r"\*:((?:\d{1,2})(?:,\d{1,2})+):00", time_expr)
+        if match:
+            minutes = [int(item) for item in match.group(1).split(",")]
+            interval = evenly_spaced(minutes, 60)
+            if interval is not None:
+                start_minute = min(minutes)
+                phrase = f"every {interval}m"
+                if start_minute != 0:
+                    phrase = f"{phrase} from :{start_minute:02d}"
+                return with_calendar_prefix(prefix, phrase)
+            clock_points = [f":{minute:02d}" for minute in sorted(dict.fromkeys(minutes))]
+            return with_calendar_prefix(prefix, f"hourly at {format_short_list(clock_points)}")
+
         match = re.fullmatch(r"\*:(\d{1,2})/(\d{1,2}):00", time_expr)
         if match:
             start_minute = int(match.group(1))
             every_minutes = int(match.group(2))
-            phrase = f"every {every_minutes} minute{'s' if every_minutes != 1 else ''}"
+            phrase = f"every {every_minutes}m"
             if start_minute != 0:
                 phrase = f"{phrase} from :{start_minute:02d}"
             return with_calendar_prefix(prefix, phrase)
+
+        match = re.fullmatch(r"((?:\d{2}:\d{2}:\d{2})(?:,\d{2}:\d{2}:\d{2})+)", time_expr)
+        if match:
+            times = [item[:5] for item in match.group(1).split(",")]
+            base = "daily" if not prefix else prefix
+            return f"{base} at {format_short_list(times)}"
 
         match = re.fullmatch(r"(\d{1,2})/(\d{1,2}):(\d{2}):00", time_expr)
         if match:
             start_hour = int(match.group(1))
             every_hours = int(match.group(2))
             minute = int(match.group(3))
-            phrase = f"every {every_hours} hour{'s' if every_hours != 1 else ''}"
+            phrase = f"every {every_hours}h"
             if start_hour != 0 or minute != 0:
                 phrase = f"{phrase} from {start_hour:02d}:{minute:02d}"
             return with_calendar_prefix(prefix, phrase)
@@ -1313,43 +1415,75 @@ def humanize_timer_calendar(value: str) -> str:
     return cleaned
 
 
+def summarize_calendar_phrases(phrases: List[str]) -> str:
+    cleaned: List[str] = []
+    for phrase in phrases:
+        text = (phrase or "").strip()
+        if text and text not in cleaned:
+            cleaned.append(text)
+    if not cleaned:
+        return ""
+    if len(cleaned) == 1:
+        return cleaned[0]
+
+    grouped: Dict[str, List[str]] = {}
+    remainder: List[str] = []
+    for phrase in cleaned:
+        match = re.fullmatch(r"(.+?) at ((?::\d{2}|\d{2}:\d{2})(?:, (?::\d{2}|\d{2}:\d{2}))*?)", phrase)
+        if not match:
+            remainder.append(phrase)
+            continue
+        prefix = match.group(1)
+        times = [item.strip() for item in match.group(2).split(",") if item.strip()]
+        bucket = grouped.setdefault(prefix, [])
+        for time_text in times:
+            if time_text not in bucket:
+                bucket.append(time_text)
+
+    merged: List[str] = []
+    used_prefixes: Set[str] = set()
+    for phrase in cleaned:
+        match = re.fullmatch(r"(.+?) at ((?::\d{2}|\d{2}:\d{2})(?:, (?::\d{2}|\d{2}:\d{2}))*?)", phrase)
+        if not match:
+            continue
+        prefix = match.group(1)
+        if prefix in used_prefixes:
+            continue
+        used_prefixes.add(prefix)
+        merged.append(f"{prefix} at {format_short_list(grouped.get(prefix, []))}")
+
+    merged.extend(remainder)
+    if len(merged) == 1:
+        return merged[0]
+    return f"{merged[0]}; +{len(merged) - 1} more"
+
+
 def timer_triggers_for_display(svc: ManagedService, max_width: int = 48) -> str:
     timer_unit = f"{svc.name}.timer"
-    parts: List[str] = []
-
-    def add_part(text: str) -> None:
-        cleaned = (text or "").strip()
-        if cleaned and cleaned not in parts:
-            parts.append(cleaned)
+    summary = "-"
 
     if unit_exists(timer_unit, scope=svc.scope):
         directives = parse_unit_directive_values(systemctl_cat(timer_unit, scope=svc.scope))
-        for raw in directives.get("OnCalendar", []):
-            add_part(humanize_timer_calendar(raw))
-        for raw in directives.get("OnBootSec", []):
-            add_part(f"{humanize_systemd_duration(raw)} after boot")
-        for raw in directives.get("OnStartupSec", []):
-            add_part(f"{humanize_systemd_duration(raw)} after startup")
-        for raw in directives.get("OnActiveSec", []):
-            add_part(f"{humanize_systemd_duration(raw)} after timer starts")
-        for raw in directives.get("OnUnitActiveSec", []):
-            add_part(f"every {humanize_systemd_duration(raw)} after last run")
-        for raw in directives.get("OnUnitInactiveSec", []):
-            add_part(f"{humanize_systemd_duration(raw)} after service stops")
-        for raw in directives.get("RandomizedDelaySec", []):
-            add_part(f"jitter up to {humanize_systemd_duration(raw)}")
-        for raw in directives.get("AccuracySec", []):
-            add_part(f"accuracy {humanize_systemd_duration(raw)}")
-        for raw in directives.get("Persistent", []):
-            if parse_bool(raw, default=False):
-                add_part("catch up if missed")
+        calendar_parts = [humanize_timer_calendar(raw) for raw in directives.get("OnCalendar", []) if raw.strip()]
+        calendar_summary = summarize_calendar_phrases(calendar_parts)
+        if calendar_summary:
+            summary = calendar_summary
+        elif directives.get("OnUnitActiveSec"):
+            summary = f"every {compact_systemd_duration(directives['OnUnitActiveSec'][0])}"
+        elif directives.get("OnUnitInactiveSec"):
+            summary = f"every {compact_systemd_duration(directives['OnUnitInactiveSec'][0])} after stop"
+        elif directives.get("OnStartupSec"):
+            summary = f"{compact_systemd_duration(directives['OnStartupSec'][0])} after startup"
+        elif directives.get("OnBootSec"):
+            summary = f"{compact_systemd_duration(directives['OnBootSec'][0])} after boot"
+        elif directives.get("OnActiveSec"):
+            summary = f"{compact_systemd_duration(directives['OnActiveSec'][0])} after timer starts"
 
-    if not parts:
+    if summary == "-":
         schedule = schedule_for_display(svc)
         if schedule:
-            add_part(humanize_timer_calendar(schedule))
+            summary = humanize_timer_calendar(schedule)
 
-    summary = "; ".join(parts) if parts else "-"
     return clip_text(summary, max_width) if max_width > 0 else summary
 
 

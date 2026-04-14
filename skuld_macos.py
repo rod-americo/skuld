@@ -1010,8 +1010,6 @@ def humanize_schedule_for_display(schedule: str, timer_persistent: bool, max_wid
                     else:
                         summary = value
 
-    if timer_persistent:
-        summary = f"{summary}; run at load"
     return clip_text(summary, max_width)
 
 
