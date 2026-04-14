@@ -21,6 +21,7 @@ The format is inspired by Keep a Changelog and follows semantic versioning inten
 - `list` output redesigned with table formatting and clearer status rendering.
 - `list` now shows a human-readable `triggers` column and drops the redundant Linux `scope` column.
 - `list` now sorts by `name` by default.
+- `list` now adapts to terminal width by shortening flexible columns and hiding lower-priority ones when needed.
 - Documentation now treats `systemd --user` as the default Linux persistence path and frames `sudo` as optional for `system` scope operations.
 
 ### Fixed

@@ -4,6 +4,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 from dataclasses import dataclass, asdict
@@ -25,6 +26,18 @@ SYSTEMD_UNIT_STARTED_MESSAGE_ID = "39f53479d3a045ac8e11786248231fbf"
 SORT_CHOICES = ("id", "name", "cpu", "memory")
 VALID_SCOPES = ("system", "user")
 SCOPE_ALIASES = {"system": "system", "root": "system", "user": "user"}
+SERVICE_TABLE_COLUMNS = (
+    {"key": "id", "header": "id", "min_width": 2, "shrink": False},
+    {"key": "name", "header": "name", "min_width": 12, "shrink": True},
+    {"key": "service", "header": "service", "min_width": 7, "shrink": False},
+    {"key": "timer", "header": "timer", "min_width": 5, "shrink": False},
+    {"key": "triggers", "header": "triggers", "min_width": 12, "shrink": True},
+    {"key": "cpu", "header": "cpu", "min_width": 3, "shrink": False},
+    {"key": "memory", "header": "memory", "min_width": 6, "shrink": False},
+    {"key": "ports", "header": "ports", "min_width": 5, "shrink": True},
+)
+SERVICE_TABLE_SHRINK_ORDER = ("triggers", "name", "ports")
+SERVICE_TABLE_HIDE_ORDER = ("ports", "memory", "cpu", "triggers", "timer")
 SYSTEMD_DURATION_LABELS = {
     "us": ("microsecond", "microseconds"),
     "usec": ("microsecond", "microseconds"),
@@ -1180,6 +1193,97 @@ def render_table(headers: List[str], rows: List[List[str]]) -> None:
     print(hline(box["bottom_left"], box["bottom_mid"], box["bottom_right"], box["fill"]))
 
 
+def current_terminal_columns() -> Optional[int]:
+    if not is_tty():
+        return None
+    try:
+        columns = shutil.get_terminal_size().columns
+    except OSError:
+        return None
+    return columns if columns > 0 else None
+
+
+def table_widths(headers: List[str], rows: List[List[str]]) -> List[int]:
+    widths = [visible_len(h) for h in headers]
+    for row in rows:
+        for idx, cell in enumerate(row):
+            widths[idx] = max(widths[idx], visible_len(cell))
+    return widths
+
+
+def table_render_width(widths: List[int]) -> int:
+    if not widths:
+        return 0
+    return sum(widths) + (3 * len(widths)) + 1
+
+
+def clip_plain_text(text: str, width: int) -> str:
+    if visible_len(text) <= width:
+        return text
+    return clip_text(text, width)
+
+
+def shrink_service_table_widths(columns: List[Dict[str, object]], widths: Dict[str, int], max_width: int) -> Dict[str, int]:
+    adjusted = dict(widths)
+    while True:
+        total_width = table_render_width([adjusted[col["key"]] for col in columns])
+        if total_width <= max_width:
+            return adjusted
+        changed = False
+        for key in SERVICE_TABLE_SHRINK_ORDER:
+            column = next((item for item in columns if item["key"] == key), None)
+            if not column:
+                continue
+            min_width = max(int(column["min_width"]), visible_len(str(column["header"])))
+            current_width = adjusted[key]
+            if current_width <= min_width:
+                continue
+            adjusted[key] = current_width - 1
+            changed = True
+            break
+        if not changed:
+            return adjusted
+
+
+def fit_service_table(rows: List[Dict[str, object]], max_width: Optional[int] = None) -> tuple[List[str], List[List[str]]]:
+    columns = [dict(item) for item in SERVICE_TABLE_COLUMNS]
+    if max_width is None:
+        max_width = current_terminal_columns()
+
+    while True:
+        headers = [str(column["header"]) for column in columns]
+        raw_rows = [
+            [str(row[str(column["key"])]) for column in columns]
+            for row in rows
+        ]
+        if not raw_rows or max_width is None:
+            return headers, raw_rows
+
+        current_widths = table_widths(headers, raw_rows)
+        width_map = {str(column["key"]): current_widths[idx] for idx, column in enumerate(columns)}
+        width_map = shrink_service_table_widths(columns, width_map, max_width)
+        fitted_rows = []
+        for row in rows:
+            fitted_row: List[str] = []
+            for column in columns:
+                key = str(column["key"])
+                value = str(row[key])
+                target_width = width_map[key]
+                if column.get("shrink"):
+                    value = clip_plain_text(value, target_width)
+                fitted_row.append(value)
+            fitted_rows.append(fitted_row)
+
+        fitted_widths = table_widths(headers, fitted_rows)
+        if table_render_width(fitted_widths) <= max_width:
+            return headers, fitted_rows
+
+        drop_key = next((key for key in SERVICE_TABLE_HIDE_ORDER if any(col["key"] == key for col in columns)), None)
+        if drop_key is None:
+            return headers, fitted_rows
+        columns = [column for column in columns if column["key"] != drop_key]
+
+
 def render_host_panel() -> None:
     overview = read_host_overview()
     render_table(list(overview.keys()), [list(overview.values())])
@@ -1821,22 +1925,8 @@ def _render_services_table(compact: bool, sort_by: str = "name") -> None:
             }
         )
     ordered_rows = sorted(rows, key=lambda row: service_sort_key(sort_by, row))
-    render_table(
-        ["id", "name", "service", "timer", "triggers", "cpu", "memory", "ports"],
-        [
-            [
-                str(row["id"]),
-                str(row["name"]),
-                str(row["service"]),
-                str(row["timer"]),
-                str(row["triggers"]),
-                str(row["cpu"]),
-                str(row["memory"]),
-                str(row["ports"]),
-            ]
-            for row in ordered_rows
-        ],
-    )
+    headers, fitted_rows = fit_service_table(ordered_rows)
+    render_table(headers, fitted_rows)
     print()
 
 

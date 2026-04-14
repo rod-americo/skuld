@@ -272,6 +272,7 @@ skuld list --sort memory
 - After operational commands like `track`, `rename`, `untrack`, `exec`, `start`, `stop`, `restart`, and `sync`, Skuld refreshes using the compact view.
 - `triggers` summarizes the schedule in human-readable form. On Linux it includes timer directives such as `OnCalendar`, `OnBootSec`, and `OnUnitActiveSec` when available.
 - `ports` is resolved from all PIDs in the service cgroup (not only `MainPID`), so wrapper processes like `npm start` still show the app listening port.
+- On narrow terminals, Skuld shortens flexible columns and may hide lower-priority ones such as `ports`, `memory`, or `cpu` so the table still fits on screen.
 - Both views include a top host panel with:
   `uptime | cpu(load1/5/15) | memory`
 - Table borders use Unicode automatically when supported by your terminal. You can override:
